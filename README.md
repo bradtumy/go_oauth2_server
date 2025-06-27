@@ -32,7 +32,7 @@ Built using:
 └── static/ # Static files (JS, CSS)
 ```
 
-## ▶Getting Started
+## Getting Started
 
 ### Prerequisites
 
