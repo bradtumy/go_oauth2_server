@@ -74,7 +74,7 @@ curl -X POST http://localhost:9096/token \
 
 ## License
 
-MIT
+Apache-2.0 license
 
 ## Author
 
