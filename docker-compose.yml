@@ -1,0 +1,29 @@
+version: "3.9"
+services:
+  as:
+    build: .
+    image: go-oauth2-as:latest
+    container_name: go-oauth2-as
+    command: ["/bin/as"]
+    environment:
+      - AS_ISSUER=http://as:8080
+      - AS_AUDIENCE=http://rs:9090
+      - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
+      - AS_SIGNING_KEY_ID=dev-hs256
+      - AS_DEFAULT_CLIENT_ID=client-xyz
+      - AS_DEFAULT_CLIENT_SECRET=secret-xyz
+    ports:
+      - "8080:8080"
+  rs:
+    image: go-oauth2-as:latest
+    container_name: go-oauth2-rs
+    command: ["/bin/rs"]
+    environment:
+      - AS_ISSUER=http://as:8080
+      - RS_AUDIENCE=http://rs:9090
+      - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
+      - AS_SIGNING_KEY_ID=dev-hs256
+    ports:
+      - "9090:9090"
+    depends_on:
+      - as
