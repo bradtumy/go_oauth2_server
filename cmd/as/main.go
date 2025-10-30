@@ -271,11 +271,17 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 	subjectTokenType := r.PostFormValue("subject_token_type")
 	actorToken := r.PostFormValue("actor_token")
 	actorTokenType := r.PostFormValue("actor_token_type")
-	audience := r.PostFormValue("audience")
+	audience := strings.TrimSpace(r.PostFormValue("audience"))
 	if audience == "" {
-		audience = r.PostFormValue("resource")
+		audience = strings.TrimSpace(r.PostFormValue("resource"))
 	}
 	if audience == "" {
+		audience = s.cfg.Audience
+	}
+	if strings.EqualFold(audience, s.cfg.Issuer) {
+		// Prevent misconfiguration where the token exchange audience is the issuer
+		// (e.g. http://as:8080). Default back to the configured API audience so that
+		// OBO tokens target the resource server as expected.
 		audience = s.cfg.Audience
 	}
 
