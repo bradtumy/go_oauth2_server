@@ -112,7 +112,7 @@ func (s *Service) ResolveAgent(ctx context.Context, actorToken, actorType, clien
 	if actorType != "" && actorType != "urn:ietf:params:oauth:token-type:jwt" {
 		return ActClaim{}, ErrUnsupportedTokenType
 	}
-	claims, err := s.Signer.Verify(actorToken, s.Issuer)
+	claims, err := s.verifyActorToken(actorToken)
 	if err != nil {
 		return ActClaim{}, fmt.Errorf("validate actor token: %w", err)
 	}
@@ -141,6 +141,28 @@ func (s *Service) ResolveAgent(ctx context.Context, actorToken, actorType, clien
 		return ActClaim{}, fmt.Errorf("actor client_id missing")
 	}
 	return act, nil
+}
+
+func (s *Service) verifyActorToken(token string) (internaljwt.MapClaims, error) {
+	audiences := []string{s.Issuer}
+	if s.Audience != "" && s.Audience != s.Issuer {
+		audiences = append(audiences, s.Audience)
+	}
+	var lastErr error
+	for _, aud := range audiences {
+		claims, err := s.Signer.Verify(token, aud)
+		if err == nil {
+			return claims, nil
+		}
+		lastErr = err
+		if !errors.Is(err, internaljwt.ErrAudienceMismatch) {
+			return nil, err
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, internaljwt.ErrAudienceMismatch
 }
 
 // ComputePerms flattens authorization details into permissions and computes a subject hash.

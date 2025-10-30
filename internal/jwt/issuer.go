@@ -27,6 +27,17 @@ type Signer struct {
 	oboTTL     time.Duration
 }
 
+var (
+	// ErrAudienceMismatch indicates the provided audience claim does not match the expected value.
+	ErrAudienceMismatch = errors.New("audience mismatch")
+	// ErrIssuerMismatch indicates the issuer claim is unexpected.
+	ErrIssuerMismatch = errors.New("issuer mismatch")
+	// ErrTokenExpired indicates the token is no longer valid based on exp.
+	ErrTokenExpired = errors.New("token expired")
+	// ErrTokenNotYetValid indicates the token is not valid yet due to nbf.
+	ErrTokenNotYetValid = errors.New("token not yet valid")
+)
+
 // NewSigner constructs a new Signer instance.
 func NewSigner(issuer, audience string, key []byte, keyID string, accessTTL, refreshTTL, oboTTL time.Duration) *Signer {
 	return &Signer{
@@ -146,10 +157,10 @@ func (s *Signer) Verify(token, expectedAudience string) (MapClaims, error) {
 		return nil, fmt.Errorf("unmarshal claims: %w", err)
 	}
 	if iss, ok := claims["iss"].(string); !ok || iss != s.issuer {
-		return nil, errors.New("issuer mismatch")
+		return nil, ErrIssuerMismatch
 	}
 	if !validateAudience(claims["aud"], aud) {
-		return nil, errors.New("audience mismatch")
+		return nil, ErrAudienceMismatch
 	}
 	if err := validateTimes(claims); err != nil {
 		return nil, err
@@ -180,10 +191,10 @@ func validateAudience(value any, expected string) bool {
 func validateTimes(claims MapClaims) error {
 	now := time.Now().Unix()
 	if exp, ok := asInt(claims["exp"]); ok && now > exp {
-		return errors.New("token expired")
+		return ErrTokenExpired
 	}
 	if nbf, ok := asInt(claims["nbf"]); ok && now < nbf {
-		return errors.New("token not yet valid")
+		return ErrTokenNotYetValid
 	}
 	return nil
 }
