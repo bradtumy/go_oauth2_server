@@ -12,4 +12,4 @@ COPY --from=build /bin/as /bin/as
 COPY --from=build /bin/rs /bin/rs
 EXPOSE 8080 9090
 USER 65532:65532
-ENTRYPOINT ["/bin/as"]
+CMD ["/bin/as"]
