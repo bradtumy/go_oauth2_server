@@ -113,7 +113,22 @@ These steps demonstrate a complete OBO delegation flow using only `curl` and the
 
 ### Step 2 – Mint an actor client assertion
 
-Use the helper to mint a signed JWT that identifies the agent and controlling OAuth client:
+Mint a signed JWT that identifies the agent and controlling OAuth client using either the HTTP API (handy for Postman or other tooling) or the CLI helper:
+
+**Option A – HTTP API**
+
+```bash
+curl -s -X POST http://localhost:8080/mint-assertion \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "actor": "agent:ingestor-42",
+        "client": "client-xyz"
+      }'
+```
+
+The response body contains `{ "assertion": "<JWT>" }`. Optional fields include `issuer`, `audience`, `instance_id`, `key_id`, and `ttl_seconds`. Defaults match the authorization server configuration (`AS_ISSUER`, `AS_DEFAULT_CLIENT_ID`, signing key ID, and a 5 minute TTL).
+
+**Option B – CLI helper**
 
 ```bash
 go run ./tools/mint_assertion \
@@ -124,7 +139,7 @@ go run ./tools/mint_assertion \
 
 Copy the output (a compact JWT). This is the `actor_token` for token exchange. Adjust the flags to customise the actor ID or execution instance.
 
-> **Note:** The helper defaults to the same symmetric signing key as the servers. If you override `AS_SIGNING_KEY_BASE64` (for example via `.env` or Docker), pass the matching value to the tool using `-key $AS_SIGNING_KEY_BASE64` or export the variable before running the command so the signature matches.
+> **Note:** Both options default to the same symmetric signing key as the servers. If you override `AS_SIGNING_KEY_BASE64` (for example via `.env` or Docker), pass the matching value to the tool using `-key $AS_SIGNING_KEY_BASE64` or supply it in the server configuration before making the API call so the signature matches.
 
 ### Step 3 – Exchange for an OBO token
 

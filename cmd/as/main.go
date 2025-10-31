@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"go_oauth2_server/internal/assertion"
 	"go_oauth2_server/internal/config"
 	internaljwt "go_oauth2_server/internal/jwt"
 	"go_oauth2_server/internal/obo"
@@ -56,6 +57,7 @@ func main() {
 	mux.HandleFunc("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
 	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
 	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.HandleFunc("/mint-assertion", methodHandler(http.MethodPost, srv.handleMintAssertion))
 
 	addr := ":8080"
 	if v := os.Getenv("AS_LISTEN_ADDR"); v != "" {
@@ -170,6 +172,78 @@ func (s *authorizationServer) handleToken(w http.ResponseWriter, r *http.Request
 	default:
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant type not supported")
 	}
+}
+
+func (s *authorizationServer) handleMintAssertion(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+
+	var req struct {
+		Issuer     string `json:"issuer"`
+		Audience   string `json:"audience"`
+		Client     string `json:"client"`
+		Actor      string `json:"actor"`
+		InstanceID string `json:"instance_id"`
+		KeyID      string `json:"key_id"`
+		TTLSeconds int    `json:"ttl_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body")
+		return
+	}
+
+	actor := strings.TrimSpace(req.Actor)
+	if actor == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "actor required")
+		return
+	}
+
+	clientID := strings.TrimSpace(req.Client)
+	if clientID == "" {
+		clientID = s.cfg.DefaultClientID
+	}
+
+	issuer := strings.TrimSpace(req.Issuer)
+	if issuer == "" {
+		issuer = s.cfg.Issuer
+	}
+
+	audience := strings.TrimSpace(req.Audience)
+	if audience == "" {
+		audience = s.cfg.Audience
+	}
+
+	instanceID := strings.TrimSpace(req.InstanceID)
+
+	keyID := strings.TrimSpace(req.KeyID)
+	if keyID == "" {
+		keyID = s.cfg.SigningKeyID
+	}
+
+	var ttl time.Duration
+	if req.TTLSeconds > 0 {
+		ttl = time.Duration(req.TTLSeconds) * time.Second
+	}
+
+	token, err := assertion.MintClientAssertion(assertion.MintOptions{
+		Issuer:     issuer,
+		Audience:   audience,
+		ClientID:   clientID,
+		ActorID:    actor,
+		InstanceID: instanceID,
+		SigningKey: s.cfg.SigningKey,
+		KeyID:      keyID,
+		TTL:        ttl,
+	})
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, assertion.ErrMissingKey) {
+			status = http.StatusInternalServerError
+		}
+		writeOAuthError(w, status, "invalid_request", err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"assertion": token})
 }
 
 func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
