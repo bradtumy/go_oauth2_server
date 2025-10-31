@@ -144,6 +144,9 @@ func (s *Service) ResolveAgent(ctx context.Context, actorToken, actorType, clien
 	if inst, ok := claims["instance_id"].(string); ok {
 		act.InstanceID = inst
 	}
+	if tokenUse, ok := claims["token_use"].(string); ok && strings.EqualFold(tokenUse, "subject_assertion") {
+		act.ClientID = ""
+	}
 	if act.Actor == "" {
 		if sub, ok := claims["sub"].(string); ok && sub != "" {
 			act.Actor = sub
