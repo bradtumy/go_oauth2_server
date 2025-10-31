@@ -540,7 +540,11 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 
 	subject, _, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
 	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		code := "invalid_request"
+		if errors.Is(err, obo.ErrInvalidToken) {
+			code = "invalid_grant"
+		}
+		writeOAuthError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
 	human, err := s.lookupHumanByID(r.Context(), subject)

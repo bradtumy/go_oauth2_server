@@ -103,18 +103,21 @@ func (s *Service) ValidateSubjectToken(ctx context.Context, tok, tokType string)
 		}
 		lastErr = err
 		if !errors.Is(err, internaljwt.ErrAudienceMismatch) {
-			return "", nil, fmt.Errorf("validate subject token: %w", err)
+			return "", nil, fmt.Errorf("%w: validate subject token: %v", ErrInvalidToken, err)
 		}
 	}
 	if claims == nil {
-		return "", nil, fmt.Errorf("validate subject token: %w", lastErr)
+		if lastErr == nil {
+			lastErr = internaljwt.ErrAudienceMismatch
+		}
+		return "", nil, fmt.Errorf("%w: validate subject token: %v", ErrInvalidToken, lastErr)
 	}
 	if iss, ok := claims["iss"].(string); ok && iss != s.Issuer {
-		return "", nil, fmt.Errorf("subject token issuer mismatch")
+		return "", nil, fmt.Errorf("%w: subject token issuer mismatch", ErrInvalidToken)
 	}
 	subject, ok := claims["sub"].(string)
 	if !ok || subject == "" {
-		return "", nil, fmt.Errorf("subject token missing sub")
+		return "", nil, fmt.Errorf("%w: subject token missing sub", ErrInvalidToken)
 	}
 	return subject, claims, nil
 }
