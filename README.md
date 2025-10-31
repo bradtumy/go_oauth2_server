@@ -48,7 +48,7 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 
 ## Prerequisites
 
-- Go **1.22+**
+- Go **1.24+**
 - `curl`
 - Optional: Docker & Docker Compose v2
 - Optional: `make`
