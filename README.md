@@ -124,6 +124,8 @@ go run ./tools/mint_assertion \
 
 Copy the output (a compact JWT). This is the `actor_token` for token exchange. Adjust the flags to customise the actor ID or execution instance.
 
+> **Note:** The helper defaults to the same symmetric signing key as the servers. If you override `AS_SIGNING_KEY_BASE64` (for example via `.env` or Docker), pass the matching value to the tool using `-key $AS_SIGNING_KEY_BASE64` or export the variable before running the command so the signature matches.
+
 ### Step 3 – Exchange for an OBO token
 
 ```bash
