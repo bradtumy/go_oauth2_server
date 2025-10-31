@@ -6,12 +6,17 @@ services:
     container_name: go-oauth2-as
     command: ["/bin/as"]
     environment:
-      - AS_ISSUER=http://as:8080
-      - AS_AUDIENCE=http://rs:9090
+      - ISSUER=http://as:8080
+      - RS_AUDIENCE=http://rs:9090
+      - ADMIN_TOKEN=
+      - ALLOW_LEGACY_HARDCODED=false
+      - SEED_IDENTITIES_JSON=
       - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
       - AS_SIGNING_KEY_ID=dev-hs256
       - AS_DEFAULT_CLIENT_ID=client-xyz
       - AS_DEFAULT_CLIENT_SECRET=secret-xyz
+    volumes:
+      - ./data:/data
     ports:
       - "8080:8080"
   rs:
@@ -19,10 +24,8 @@ services:
     container_name: go-oauth2-rs
     command: ["/bin/rs"]
     environment:
-      - AS_ISSUER=http://as:8080
       - RS_AUDIENCE=http://rs:9090
-      - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
-      - AS_SIGNING_KEY_ID=dev-hs256
+      - AS_JWKS_URL=http://as:8080/.well-known/jwks.json
     ports:
       - "9090:9090"
     depends_on:

@@ -1,25 +1,29 @@
 package config
 
 import (
-	"encoding/base64"
-	"fmt"
-	"os"
-	"strconv"
-	"time"
+        "encoding/base64"
+        "fmt"
+        "os"
+        "strconv"
+        "strings"
+        "time"
 )
 
 // Config represents runtime configuration for the authorization server.
 type Config struct {
-	Issuer              string
-	Audience            string
-	SigningKey          []byte
-	SigningKeyID        string
-	DefaultClientID     string
-	DefaultClientSecret string
-	CodeTTL             time.Duration
-	AccessTokenTTL      time.Duration
-	RefreshTokenTTL     time.Duration
-	OBOTokenTTL         time.Duration
+        Issuer              string
+        Audience            string
+        SigningKey          []byte
+        SigningKeyID        string
+        DefaultClientID     string
+        DefaultClientSecret string
+        CodeTTL             time.Duration
+        AccessTokenTTL      time.Duration
+        RefreshTokenTTL     time.Duration
+        OBOTokenTTL         time.Duration
+        AdminToken          string
+        AllowLegacy         bool
+        SeedIdentitiesPath  string
 }
 
 const (
@@ -37,13 +41,15 @@ const (
 
 // Load loads configuration from environment variables.
 func Load() (*Config, error) {
-	cfg := &Config{
-		Issuer:              getEnv("AS_ISSUER", defaultIssuer),
-		Audience:            getEnv("AS_AUDIENCE", defaultAudience),
-		DefaultClientID:     getEnv("AS_DEFAULT_CLIENT_ID", defaultClientID),
-		DefaultClientSecret: getEnv("AS_DEFAULT_CLIENT_SECRET", defaultClientSecret),
-		SigningKeyID:        getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
-	}
+        cfg := &Config{
+                Issuer:              firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
+                Audience:            firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
+                DefaultClientID:     getEnv("AS_DEFAULT_CLIENT_ID", defaultClientID),
+                DefaultClientSecret: getEnv("AS_DEFAULT_CLIENT_SECRET", defaultClientSecret),
+                SigningKeyID:        getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
+                AdminToken:          getEnv("ADMIN_TOKEN", ""),
+                SeedIdentitiesPath:  getEnv("SEED_IDENTITIES_JSON", ""),
+        }
 
 	signingKeyRaw := getEnv("AS_SIGNING_KEY_BASE64", defaultSigningKeyB64)
 	key, err := base64.StdEncoding.DecodeString(signingKeyRaw)
@@ -74,9 +80,15 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	cfg.OBOTokenTTL = oboTTL
+        cfg.OBOTokenTTL = oboTTL
 
-	return cfg, nil
+        allowLegacy, err := parseBool("ALLOW_LEGACY_HARDCODED", false)
+        if err != nil {
+                return nil, err
+        }
+        cfg.AllowLegacy = allowLegacy
+
+        return cfg, nil
 }
 
 func parseDurationSeconds(env string, fallback int) (time.Duration, error) {
@@ -95,8 +107,32 @@ func parseDurationSeconds(env string, fallback int) (time.Duration, error) {
 }
 
 func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+        if v := os.Getenv(key); v != "" {
+                return v
+        }
+        return fallback
+}
+
+func parseBool(env string, fallback bool) (bool, error) {
+        raw := getEnv(env, "")
+        if raw == "" {
+                return fallback, nil
+        }
+        switch strings.ToLower(strings.TrimSpace(raw)) {
+        case "1", "true", "yes", "y":
+                return true, nil
+        case "0", "false", "no", "n":
+                return false, nil
+        default:
+                return false, fmt.Errorf("invalid %s: %s", env, raw)
+        }
+}
+
+func firstNonEmpty(values ...string) string {
+        for _, v := range values {
+                if strings.TrimSpace(v) != "" {
+                        return v
+                }
+        }
+        return ""
 }

@@ -1,21 +1,30 @@
 # go_oauth2_server
 
-An educational OAuth 2.0 authorization server and demo resource server written in Go. The service now supports standard OAuth 2.0 grants **and** [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) Token Exchange for on-behalf-of (OBO) delegation scenarios. Tokens are minted as JSON Web Tokens (JWTs) signed with a shared symmetric key, and a small resource server validates the resulting OBO tokens.
+An educational OAuth 2.0 authorisation server and companion resource server written in Go. The service supports:
+
+- The authorisation code, refresh token, and client credentials grants.
+- [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) Token Exchange for on-behalf-of (OBO) delegation.
+- Rich authorisation requests (`authorization_details`) with permission hashing.
+- Identity registration APIs for both humans and agents that drive every OAuth/OBO flow.
+
+The project is intended for local development and demo scenarios. Tokens are JSON Web Tokens (JWTs) signed with a symmetric key; the resource server verifies them using the shared key and a published JWKS endpoint.
 
 ## Contents
 
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [Running locally](#running-locally)
-- [Running with Docker](#running-with-docker)
-- [RFC 8693 Token Exchange (On-Behalf-Of) – How to Test](#rfc-8693-token-exchange-on-behalf-of--how-to-test)
-  - [Step 1 – Obtain a user access token](#step-1--obtain-a-user-access-token)
-  - [Step 2 – Mint an actor client assertion](#step-2--mint-an-actor-client-assertion)
-  - [Step 3 – Exchange for an OBO token](#step-3--exchange-for-an-obo-token)
-  - [Step 4 – Call the resource server](#step-4--call-the-resource-server)
-  - [Negative testing ideas](#negative-testing-ideas)
+- [Running with Docker Compose](#running-with-docker-compose)
+- [Identity Registration & End-to-End OAuth/OBO with Registered Identities](#identity-registration--end-to-end-oauthobo-with-registered-identities)
+  - [1. Run the services](#1-run-the-services)
+  - [2. Register identities](#2-register-identities)
+  - [3. Authorisation code flow](#3-authorisation-code-flow)
+  - [4. Mint a subject assertion](#4-mint-a-subject-assertion)
+  - [5. Perform RFC 8693 token exchange](#5-perform-rfc-8693-token-exchange)
+  - [6. Call the resource server](#6-call-the-resource-server)
+  - [7. Negative tests](#7-negative-tests)
   - [Postman collection](#postman-collection)
-- [Automation & scripts](#automation--scripts)
+- [Tests](#tests)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 
@@ -24,277 +33,281 @@ An educational OAuth 2.0 authorization server and demo resource server written i
 ```
 +----------------------+           +--------------------------+
 |  Authorization Server |  OBO JWT  |      Resource Server     |
-|  (cmd/as)             |---------> |  (cmd/rs)                |
+|  (cmd/as)             |---------> |      (cmd/rs)            |
 |                      |           |                          |
-| • /authorize          |          | • /accounts/{id}/orders/ |
-| • /token              |          |   export                 |
-| • /.well-known/jwks   |          | • Validates JWT, perm,   |
-| • RFC 8693 OBO grant  |          |   authorization_details  |
+| • /register/human    |           | • /accounts/{id}/orders/ |
+| • /register/agent    |           |   export                 |
+| • /authorize         |           | • Validates JWT, perm,   |
+| • /token             |           |   authorization_details  |
+| • /subject-assertion |           |                          |
 +----------------------+           +--------------------------+
 ```
 
-- **Authorization Server** – issues authorization codes, user access tokens, client credentials, refresh tokens, and short-lived OBO tokens. Tokens are JWTs with `act`, `perm`, and `authorization_details` claims.
-- **Resource Server** – tiny API that expects an OBO token and checks:
-  - signature/issuer/audience/expiry,
-  - `sub` (human) and `act.actor` (agent),
-  - permission string `orders:export:<account-id>`,
-  - rich authorization details contain the requested `account-id`.
+- **Authorization Server** – owns human and agent registrations, issues authorisation codes, access tokens, refresh tokens, subject assertions, and OBO tokens. All flows resolve identities from the in-memory identity store.
+- **Resource Server** – a tiny API that expects an OBO access token. It verifies the signature, audience, issuer, human subject, actor information, `perm` claim, and `authorization_details` payload.
 
 ## Prerequisites
 
 - Go **1.22+**
 - `curl`
 - Optional: Docker & Docker Compose v2
-- Optional: `make` (for helper targets)
+- Optional: `make`
 
 ## Running locally
 
 ```bash
-# Install dependencies and build everything
+# Install dependencies
 go mod tidy
 
-# Start the authorization server
-AS_ISSUER=http://localhost:8080 go run ./cmd/as
+# Start the authorisation server
+ISSUER=http://localhost:8080 \
+RS_AUDIENCE=http://localhost:9090 \
+go run ./cmd/as
 
-# In a second terminal start the resource server
-RS_AUDIENCE=http://localhost:9090 go run ./cmd/rs
+# In another terminal start the resource server
+RS_AUDIENCE=http://localhost:9090 \
+AS_JWKS_URL=http://localhost:8080/.well-known/jwks.json \
+go run ./cmd/rs
 ```
 
-Both services expose `/healthz` endpoints. Defaults are tuned for local development and align with the examples below.
+Both services expose `/healthz` endpoints. Configuration is driven via environment variables (see [Configuration](#configuration)).
 
-## Running with Docker
+## Running with Docker Compose
 
 ```bash
-# Build once
-docker compose build
-
-# Start the authorization server and demo resource server
-docker compose up
+docker compose up --build
 ```
 
 The compose file publishes:
 
-- Authorization Server: `http://localhost:8080`
-- Resource Server: `http://localhost:9090`
+- Authorisation server: `http://localhost:8080`
+- Resource server: `http://localhost:9090`
 
-Override configuration using environment variables or a local `.env` file (see [Configuration](#configuration)).
+Set additional environment variables by editing `docker-compose.yml` or creating a local `.env` file.
 
-## RFC 8693 Token Exchange (On-Behalf-Of) – How to Test
+## Identity Registration & End-to-End OAuth/OBO with Registered Identities
 
-These steps demonstrate a complete OBO delegation flow using only `curl` and the helper tool in `tools/mint_assertion`.
+Every OAuth/OBO flow relies on registered identities. The built-in APIs store data in an in-memory, thread-safe data store. Optionally protect the registration endpoints by setting `ADMIN_TOKEN` and sending `X-Admin-Token` headers.
 
-### Step 1 – Obtain a user access token
-
-1. **Request an authorization code** (the server trusts the `X-Demo-User` header as the authenticated human):
-
-   ```bash
-   curl -i -G \
-     -H "X-Demo-User: user:123" \
-     --data-urlencode "response_type=code" \
-     --data-urlencode "client_id=client-xyz" \
-     --data-urlencode "redirect_uri=http://localhost:8081/callback" \
-     --data-urlencode "scope=orders:export" \
-     --data-urlencode "state=demo" \
-     http://localhost:8080/authorize
-   ```
-
-   Inspect the `Location` header for the `code` parameter.
-
-2. **Exchange the code for a user access token**:
-
-   ```bash
-   curl -s -u client-xyz:secret-xyz -X POST http://localhost:8080/token \
-     -d 'grant_type=authorization_code' \
-     --data-urlencode 'code=<AUTH_CODE_FROM_STEP_1>' \
-     --data-urlencode 'redirect_uri=http://localhost:8081/callback'
-   ```
-
-   Save the `access_token` from the JSON response – that becomes the `subject_token` in the next step.
-
-### Step 2 – Mint an actor client assertion
-
-Mint a signed JWT that identifies the agent and controlling OAuth client using either the HTTP API (handy for Postman or other tooling) or the CLI helper:
-
-**Option A – HTTP API**
+### 1. Run the services
 
 ```bash
-curl -s -X POST http://localhost:8080/mint-assertion \
+go run ./cmd/as
+# or
+docker compose up --build
+```
+
+### 2. Register identities
+
+```bash
+# Create a human
+curl -sS -X POST http://localhost:8080/register/human \
   -H 'Content-Type: application/json' \
-  -d '{
-        "actor": "agent:ingestor-42",
-        "client": "client-xyz"
-      }'
+  -d '{"email":"alice@example.com","name":"Alice Example","tenant_id":"default"}' | jq .
+
+# Create an agent (client_id must match your OAuth client)
+curl -sS -X POST http://localhost:8080/register/agent \
+  -H 'Content-Type: application/json' \
+  -d '{"agent_id":"ingestor-42","name":"Data Ingestor","client_id":"client-xyz","capabilities":["orders:read","orders:export"],"tenant_id":"default"}' | jq .
 ```
 
-The response body contains `{ "assertion": "<JWT>" }`. Optional fields include `issuer`, `audience`, `instance_id`, `key_id`, and `ttl_seconds`. Defaults match the authorization server configuration (`AS_ISSUER`, `AS_DEFAULT_CLIENT_ID`, signing key ID, and a 5 minute TTL).
-
-**Option B – CLI helper**
+Optional administrative helpers:
 
 ```bash
-go run ./tools/mint_assertion \
-  -actor agent:ingestor-42 \
-  -client client-xyz \
-  -audience http://localhost:8080
+curl -sS http://localhost:8080/humans | jq .
+curl -sS http://localhost:8080/agents | jq .
 ```
 
-Copy the output (a compact JWT). This is the `actor_token` for token exchange. Adjust the flags to customise the actor ID or execution instance.
-
-> **Note:** Both options default to the same symmetric signing key as the servers. If you override `AS_SIGNING_KEY_BASE64` (for example via `.env` or Docker), pass the matching value to the tool using `-key $AS_SIGNING_KEY_BASE64` or supply it in the server configuration before making the API call so the signature matches.
-
-### Step 3 – Exchange for an OBO token
+### 3. Authorisation code flow
 
 ```bash
-curl -s -u client-xyz:secret-xyz -X POST http://localhost:8080/token \
+# Launch the authorisation request (use either human_id or email)
+open "http://localhost:8080/authorize?response_type=code&client_id=client-xyz&redirect_uri=http://localhost:8081/cb&scope=openid&email=alice@example.com"
+
+# Exchange the code for tokens
+curl -sS -X POST http://localhost:8080/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=authorization_code' \
+  -d 'code=<CODE_FROM_REDIRECT>' \
+  -d 'client_id=client-xyz' \
+  -d 'client_secret=secret-xyz' \
+  -d 'redirect_uri=http://localhost:8081/cb' | jq .
+```
+
+The access token’s `sub` claim equals the registered human ID, and includes `email`, `name`, and `tenant_id` claims.
+
+### 4. Mint a subject assertion
+
+```bash
+curl -sS -X POST http://localhost:8080/subject-assertion \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com"}' | jq .
+```
+
+Subject assertions are short-lived JWTs (`iss = aud =` authorisation server) used as `subject_token` in token exchange requests.
+
+### 5. Perform RFC 8693 token exchange
+
+```bash
+curl -sS -X POST http://localhost:8080/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
   -d 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
-  --data-urlencode 'subject_token=<USER_ACCESS_TOKEN>' \
+  -d "subject_token=<SUBJECT_ASSERTION_OR_ACCESS_TOKEN>" \
   -d 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
-  --data-urlencode 'actor_token=<ACTOR_ASSERTION_JWT>' \
-  -d 'actor_token_type=urn:ietf:params:oauth:token-type:jwt' \
   -d 'audience=http://localhost:9090' \
-  --data-urlencode 'authorization_details=[{"type":"agent-action","locations":["http://localhost:9090"],"actions":["orders:export"],"constraints":{"resource_ids":["acct:abc"],"time_limit_sec":900,"max_records":1000,"purpose":"customer_export"}}]'
+  -d 'client_id=client-xyz' \
+  -d 'client_secret=secret-xyz' \
+  --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
 ```
 
-The response contains a short-lived OBO access token with `act`, `perm`, and `authorization_details` claims:
+- The `subject_token` must resolve to a registered human.
+- The authenticated client (optionally overridden via `agent_id`) must resolve to a registered agent with matching capabilities.
+- The returned OBO token contains `sub` (human ID) and an `act` claim whose `actor` value equals the registered agent ID.
 
-```json
+### 6. Call the resource server
+
+```bash
+curl -sS -H "Authorization: Bearer <OBO_ACCESS_TOKEN>" \
+  http://localhost:9090/accounts/acct:abc/orders/export | jq .
+```
+
+### 7. Negative tests
+
+- Request `/authorize` without `human_id`/`email` → `400 invalid_request`.
+- Perform token exchange with an unknown agent or mismatched `client_id` → `400 invalid_request`.
+- Request OBO permissions that the agent is not entitled to → `403 invalid_request` with `no permissions` message.
+
+### Seeding identities
+
+Bootstrap demo data by creating a JSON file and pointing `SEED_IDENTITIES_JSON` at it before starting the server:
+
+```jsonc
 {
-  "access_token": "<OBO_JWT>",
-  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-  "token_type": "bearer",
-  "expires_in": 900,
-  "perm": ["orders:export:acct:abc"],
-  "authorization_details": [ ... ]
+  "humans": [
+    {
+      "email": "alice@example.com",
+      "name": "Alice Example",
+      "tenant_id": "default"
+    }
+  ],
+  "agents": [
+    {
+      "agent_id": "ingestor-42",
+      "name": "Data Ingestor",
+      "client_id": "client-xyz",
+      "capabilities": ["orders:read", "orders:export"],
+      "tenant_id": "default"
+    }
+  ]
 }
 ```
 
-### Step 4 – Call the resource server
-
 ```bash
-curl -s \
-  -H "Authorization: Bearer <OBO_JWT>" \
-  http://localhost:9090/accounts/acct:abc/orders/export
+SEED_IDENTITIES_JSON=./data/seed.json go run ./cmd/as
 ```
 
-Expected response:
-
-```json
-{"status":"ok","actor":"agent:ingestor-42","subject":"user:123","resource":"acct:abc"}
-```
-
-### Negative testing ideas
-
-- **Wrong account ID** – call `/accounts/acct:evil/orders/export` and expect `403`.
-- **Missing `act` claim** – omit the actor token and remove the authenticated client: the server rejects the request.
-- **Expired token** – wait for the `exp` to pass (default 15 minutes) or set `AS_OBO_TOKEN_TTL_SECONDS=10` for quick expiry.
+When using Docker Compose, mount the file and set the environment variable in `docker-compose.yml`.
 
 ### Postman collection
 
-Import the snippet below into Postman. It contains three requests wired together. Configure an environment with variables `AS_BASE`, `RS_BASE`, `USER_TOKEN`, `ACTOR_ASSERTION`, and `OBO_TOKEN` (the tests update these automatically when run sequentially).
+Import the following collection and set the environment variables `BASE_URL`, `CLIENT_ID`, `CLIENT_SECRET`, `HUMAN_EMAIL`, `HUMAN_ID`, `AGENT_ID`, and `OBO_TOKEN`.
 
 ```json
 {
   "info": {
-    "name": "go_oauth2_server OBO demo",
+    "name": "go_oauth2_server Demo",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
     {
-      "name": "1. Authorization Code",
+      "name": "Register human",
       "request": {
-        "method": "GET",
-        "header": [{"key": "X-Demo-User", "value": "user:123"}],
-        "url": {
-          "raw": "{{AS_BASE}}/authorize?response_type=code&client_id=client-xyz&redirect_uri=http://localhost:8081/callback&scope=orders:export&state=demo",
-          "host": ["{{AS_BASE}}"],
-          "path": ["authorize"],
-          "query": [
-            {"key": "response_type", "value": "code"},
-            {"key": "client_id", "value": "client-xyz"},
-            {"key": "redirect_uri", "value": "http://localhost:8081/callback"},
-            {"key": "scope", "value": "orders:export"},
-            {"key": "state", "value": "demo"}
-          ]
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": "{{BASE_URL}}/register/human",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"{{HUMAN_EMAIL}}\",\n  \"name\": \"Alice Example\",\n  \"tenant_id\": \"default\"\n}"
         }
       }
     },
     {
-      "name": "2. Token Exchange",
+      "name": "Register agent",
       "request": {
         "method": "POST",
-        "auth": {
-          "type": "basic",
-          "basic": [
-            {"key": "username", "value": "client-xyz"},
-            {"key": "password", "value": "secret-xyz"}
-          ]
-        },
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "url": "{{BASE_URL}}/register/agent",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"agent_id\": \"{{AGENT_ID}}\",\n  \"name\": \"Data Ingestor\",\n  \"client_id\": \"{{CLIENT_ID}}\",\n  \"capabilities\": [\"orders:read\", \"orders:export\"],\n  \"tenant_id\": \"default\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Token exchange",
+      "request": {
+        "method": "POST",
         "header": [{"key": "Content-Type", "value": "application/x-www-form-urlencoded"}],
-        "url": {"raw": "{{AS_BASE}}/token", "host": ["{{AS_BASE}}"], "path": ["token"]},
+        "url": "{{BASE_URL}}/token",
         "body": {
           "mode": "urlencoded",
           "urlencoded": [
             {"key": "grant_type", "value": "urn:ietf:params:oauth:grant-type:token-exchange"},
-            {"key": "subject_token", "value": "{{USER_TOKEN}}"},
+            {"key": "subject_token", "value": "{{OBO_TOKEN}}"},
             {"key": "subject_token_type", "value": "urn:ietf:params:oauth:token-type:access_token"},
-            {"key": "actor_token", "value": "{{ACTOR_ASSERTION}}"},
-            {"key": "actor_token_type", "value": "urn:ietf:params:oauth:token-type:jwt"},
-            {"key": "audience", "value": "{{RS_BASE}}"},
-            {"key": "authorization_details", "value": "[{\"type\":\"agent-action\",\"locations\":[\"{{RS_BASE}}\"],\"actions\":[\"orders:export\"],\"constraints\":{\"resource_ids\":[\"acct:abc\"],\"purpose\":\"customer_export\"}}]"}
+            {"key": "audience", "value": "http://localhost:9090"},
+            {"key": "client_id", "value": "{{CLIENT_ID}}"},
+            {"key": "client_secret", "value": "{{CLIENT_SECRET}}"},
+            {"key": "authorization_details", "value": "[{\"type\":\"agent-action\",\"actions\":[\"orders:export\"]}]"}
           ]
         }
-      }
-    },
-    {
-      "name": "3. Call Resource Server",
-      "request": {
-        "method": "GET",
-        "url": {"raw": "{{RS_BASE}}/accounts/acct:abc/orders/export", "host": ["{{RS_BASE}}"], "path": ["accounts", "acct:abc", "orders", "export"]},
-        "header": [{"key": "Authorization", "value": "Bearer {{OBO_TOKEN}}"}]
       }
     }
   ]
 }
 ```
 
-## Automation & scripts
+## Tests
 
-- `make test` – run Go unit tests (currently limited to compilation checks).
-- `make test-exchange` – executes `scripts/test_obo.sh` which drives the full code → token → exchange → resource server flow (expects both servers running locally).
-- `scripts/test_obo.sh` – reusable bash helper invoked by the make target.
+```bash
+go test ./...
+```
+
+Unit tests cover validation logic, the in-memory identity store, HTTP handlers, and end-to-end OAuth/OBO flows via `httptest`.
 
 ## Configuration
 
-All services read environment variables (see `.env.example`):
+| Environment variable          | Description                                                                                  | Default                         |
+| ----------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------- |
+| `ISSUER`                      | Issuer used in all minted tokens                                                             | `http://localhost:8080`         |
+| `RS_AUDIENCE`                 | Audience for access and OBO tokens                                                           | `http://localhost:9090`         |
+| `ADMIN_TOKEN`                 | Optional shared secret that gates `/register/*` endpoints (`X-Admin-Token` header required) | unset                           |
+| `ALLOW_LEGACY_HARDCODED`      | Set to `true` to allow legacy hard-coded users/agents (development only)                    | `false`                         |
+| `SEED_IDENTITIES_JSON`        | Path to a JSON file containing initial humans/agents (`{"humans":[],"agents":[]}`)       | unset                           |
+| `AS_DEFAULT_CLIENT_ID`        | Default OAuth client ID                                                                      | `client-xyz`                    |
+| `AS_DEFAULT_CLIENT_SECRET`    | Default OAuth client secret                                                                  | `secret-xyz`                    |
+| `AS_SIGNING_KEY_BASE64`       | Base64-encoded HMAC signing key                                                              | `ZGV2LXNpZ25pbmcta2V5LTEyMzQ=`  |
+| `AS_SIGNING_KEY_ID`           | JWT header `kid`                                                                             | `dev-hs256`                     |
+| `AS_CODE_TTL_SECONDS`         | Authorisation code lifetime (seconds)                                                        | `120`                           |
+| `AS_ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime (seconds)                                                              | `3600`                          |
+| `AS_REFRESH_TOKEN_TTL_SECONDS`| Refresh token lifetime (seconds)                                                             | `86400`                         |
+| `AS_OBO_TOKEN_TTL_SECONDS`    | OBO token lifetime (seconds)                                                                 | `900`                           |
 
-| Variable | Description | Default |
-| --- | --- | --- |
-| `AS_ISSUER` | Issuer URI embedded in all JWTs | `http://localhost:8080` |
-| `AS_AUDIENCE` | Default API audience for user/client tokens | `http://localhost:9090` |
-| `AS_SIGNING_KEY_BASE64` | Base64 encoded HS256 signing key | `dev-signing-key-1234` |
-| `AS_OBO_TOKEN_TTL_SECONDS` | Lifetime for OBO tokens | `900` |
-| `AS_DEFAULT_CLIENT_ID` / `AS_DEFAULT_CLIENT_SECRET` | Demo confidential client credentials | `client-xyz` / `secret-xyz` |
-| `RS_AUDIENCE` | Expected audience on the resource server | `http://localhost:9090` |
-
-A live JWKS is published at `/.well-known/jwks.json` for convenience so additional services can validate tokens.
+All configuration is logged at server startup (secrets are masked in logs).
 
 ## Project layout
 
 ```
-.
-├── cmd
-│   ├── as            # Authorization server entry point
-│   └── rs            # Demo resource server
-├── internal
-│   ├── config        # Environment configuration loader
-│   ├── jwt           # Signing, verification, and JWKS helpers
-│   ├── obo           # Token exchange logic (RAR parsing, ACT claims)
-│   └── store         # In-memory client/code/refresh-token store
-├── scripts           # bash automation (smoke tests)
-├── tools             # Helper utilities (e.g. client assertion minter)
-├── Dockerfile
-├── docker-compose.yml
-├── Makefile
-└── .env.example
+cmd/
+  as/   # Authorisation server
+  rs/   # Demo resource server
+internal/
+  assertion/    # (legacy helper tooling)
+  config/       # Environment-driven configuration
+  identity/     # Identity types, validation, and HTTP handlers
+  jwt/          # Minimal JWT signer/verification helpers
+  obo/          # Token exchange helpers
+  store/        # OAuth client/code/refresh stores and identity store implementations
+scripts/        # Automation helpers
 ```
 
-Happy hacking!
