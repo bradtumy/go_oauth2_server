@@ -1,16 +1,14 @@
 package main
 
 import (
-	"crypto/hmac"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"time"
 
+	"go_oauth2_server/internal/assertion"
 	"go_oauth2_server/internal/random"
 )
 
@@ -31,38 +29,21 @@ func main() {
 		log.Fatalf("decode key: %v", err)
 	}
 
-	now := time.Now().UTC()
-	claims := map[string]any{
-		"iss":         *issuer,
-		"sub":         *actorID,
-		"aud":         *audience,
-		"iat":         now.Unix(),
-		"exp":         now.Add(5 * time.Minute).Unix(),
-		"jti":         random.NewID(),
-		"actor":       *actorID,
-		"client_id":   *clientID,
-		"instance_id": *instanceID,
-	}
-	header := map[string]any{
-		"alg": "HS256",
-		"typ": "JWT",
-	}
-	if *keyID != "" {
-		header["kid"] = *keyID
-	}
-	headerJSON, err := json.Marshal(header)
+	token, err := assertion.MintClientAssertion(assertion.MintOptions{
+		Issuer:     *issuer,
+		Audience:   *audience,
+		ClientID:   *clientID,
+		ActorID:    *actorID,
+		InstanceID: *instanceID,
+		SigningKey: key,
+		KeyID:      *keyID,
+		TTL:        5 * time.Minute,
+	})
 	if err != nil {
-		log.Fatalf("marshal header: %v", err)
+		log.Fatalf("mint assertion: %v", err)
 	}
-	claimsJSON, err := json.Marshal(claims)
-	if err != nil {
-		log.Fatalf("marshal claims: %v", err)
-	}
-	unsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
-	mac := hmac.New(sha256.New, key)
-	mac.Write([]byte(unsigned))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	fmt.Print(unsigned + "." + sig)
+
+	fmt.Print(token)
 }
 
 func getEnv(key, fallback string) string {
