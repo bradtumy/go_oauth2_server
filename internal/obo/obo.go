@@ -87,9 +87,27 @@ func (s *Service) ValidateSubjectToken(ctx context.Context, tok, tokType string)
 	if !allowed[tokType] {
 		return "", nil, ErrUnsupportedTokenType
 	}
-	claims, err := s.Signer.Verify(tok, s.Audience)
-	if err != nil {
-		return "", nil, fmt.Errorf("validate subject token: %w", err)
+	audiences := []string{s.Audience}
+	if s.Issuer != "" && s.Issuer != s.Audience {
+		audiences = append(audiences, s.Issuer)
+	}
+	var (
+		claims  internaljwt.MapClaims
+		lastErr error
+	)
+	for _, aud := range audiences {
+		c, err := s.Signer.Verify(tok, aud)
+		if err == nil {
+			claims = c
+			break
+		}
+		lastErr = err
+		if !errors.Is(err, internaljwt.ErrAudienceMismatch) {
+			return "", nil, fmt.Errorf("validate subject token: %w", err)
+		}
+	}
+	if claims == nil {
+		return "", nil, fmt.Errorf("validate subject token: %w", lastErr)
 	}
 	if iss, ok := claims["iss"].(string); ok && iss != s.Issuer {
 		return "", nil, fmt.Errorf("subject token issuer mismatch")
@@ -166,35 +184,14 @@ func (s *Service) verifyActorToken(token string) (internaljwt.MapClaims, error) 
 }
 
 // ComputePerms flattens authorization details into permissions and computes a subject hash.
-func (s *Service) ComputePerms(humanSub string, act ActClaim, rar []RAR) ([]string, string, error) {
-	perms := make([]string, 0)
-	for _, entry := range rar {
-		if entry.Type == "" {
-			continue
-		}
-		actions := entry.Actions
-		if len(actions) == 0 {
-			continue
-		}
-		resourceIDs := extractResourceIDs(entry)
-		if len(resourceIDs) == 0 {
-			for _, action := range actions {
-				perms = append(perms, normalizeAction(action))
-			}
-			continue
-		}
-		for _, action := range actions {
-			actNorm := normalizeAction(action)
-			for _, resource := range resourceIDs {
-				perms = append(perms, fmt.Sprintf("%s:%s", actNorm, resource))
-			}
-		}
-	}
+func (s *Service) ComputePerms(humanSub string, rar []RAR, allowed []string) ([]string, []RAR, string, error) {
+	filtered := filterRARByCapabilities(rar, allowed)
+	perms := collectPerms(filtered)
 	if len(perms) == 0 {
-		return nil, "", ErrNoPermissions
+		return nil, nil, "", ErrNoPermissions
 	}
 	hash := internaljwt.ComputeSubjectHash(humanSub, perms)
-	return perms, hash, nil
+	return perms, filtered, hash, nil
 }
 
 // IssueOBOToken issues an OBO JWT using the signer.
@@ -252,4 +249,67 @@ func extractResourceIDs(entry RAR) []string {
 func normalizeAction(action string) string {
 	a := strings.ToLower(strings.TrimSpace(action))
 	return strings.ReplaceAll(a, "::", ":")
+}
+
+func filterRARByCapabilities(entries []RAR, allowed []string) []RAR {
+	if len(entries) == 0 {
+		return nil
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, capability := range allowed {
+		norm := normalizeAction(capability)
+		if norm == "" {
+			continue
+		}
+		allowedSet[norm] = struct{}{}
+	}
+	if len(allowedSet) == 0 {
+		return nil
+	}
+	filtered := make([]RAR, 0, len(entries))
+	for _, entry := range entries {
+		if entry.Type == "" || len(entry.Actions) == 0 {
+			continue
+		}
+		allowedActions := make([]string, 0, len(entry.Actions))
+		for _, action := range entry.Actions {
+			if _, ok := allowedSet[normalizeAction(action)]; ok {
+				allowedActions = append(allowedActions, action)
+			}
+		}
+		if len(allowedActions) == 0 {
+			continue
+		}
+		copyEntry := entry
+		copyEntry.Actions = allowedActions
+		filtered = append(filtered, copyEntry)
+	}
+	return filtered
+}
+
+func collectPerms(rar []RAR) []string {
+	perms := make([]string, 0)
+	for _, entry := range rar {
+		if entry.Type == "" {
+			continue
+		}
+		actions := entry.Actions
+		if len(actions) == 0 {
+			continue
+		}
+		resourceIDs := extractResourceIDs(entry)
+		if len(resourceIDs) == 0 {
+			for _, action := range actions {
+				perms = append(perms, normalizeAction(action))
+			}
+			continue
+		}
+		for _, action := range actions {
+			actNorm := normalizeAction(action)
+			for _, resource := range resourceIDs {
+				perms = append(perms, fmt.Sprintf("%s:%s", actNorm, resource))
+			}
+		}
+	}
+	return perms
 }

@@ -53,7 +53,12 @@ func NewSigner(issuer, audience string, key []byte, keyID string, accessTTL, ref
 
 // IssueAccess issues a standard access token for a subject and client.
 func (s *Signer) IssueAccess(ctx context.Context, subject, clientID, scope string) (token string, expiresIn int, err error) {
-	return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, nil)
+        return s.IssueAccessWithClaims(ctx, subject, clientID, scope, nil)
+}
+
+// IssueAccessWithClaims issues an access token with additional private claims.
+func (s *Signer) IssueAccessWithClaims(ctx context.Context, subject, clientID, scope string, extra map[string]any) (string, int, error) {
+        return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra)
 }
 
 // IssueOBOToken issues an OBO access token with given claims payload.
@@ -74,7 +79,18 @@ func (s *Signer) IssueOBOToken(ctx context.Context, subject, clientID string, pe
 	if actor != nil {
 		extraMap["act"] = actor
 	}
-	return s.issue(ctx, subject, clientID, "", perms, authz, ttl, audience, extraMap)
+        return s.issue(ctx, subject, clientID, "", perms, authz, ttl, audience, extraMap)
+}
+
+// IssueSubjectAssertion issues a subject assertion JWT for token exchange bootstrap.
+func (s *Signer) IssueSubjectAssertion(ctx context.Context, subject string, ttl time.Duration) (string, int, error) {
+        if ttl <= 0 {
+                ttl = 5 * time.Minute
+        }
+        extra := map[string]any{
+                "token_use": "subject_assertion",
+        }
+        return s.issue(ctx, subject, subject, "", nil, nil, ttl, s.issuer, extra)
 }
 
 func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, perms []string, authz any, ttl time.Duration, audience string, extra map[string]any) (token string, expiresIn int, err error) {

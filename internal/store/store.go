@@ -17,21 +17,21 @@ type Client struct {
 
 // AuthorizationCode represents an authorization code grant.
 type AuthorizationCode struct {
-	Code        string
-	ClientID    string
-	UserID      string
-	RedirectURI string
-	Scope       string
-	ExpiresAt   time.Time
+        Code        string
+        ClientID    string
+        HumanID     string
+        RedirectURI string
+        Scope       string
+        ExpiresAt   time.Time
 }
 
 // RefreshToken represents a refresh token record.
 type RefreshToken struct {
-	Token     string
-	ClientID  string
-	UserID    string
-	Scope     string
-	ExpiresAt time.Time
+        Token     string
+        ClientID  string
+        HumanID   string
+        Scope     string
+        ExpiresAt time.Time
 }
 
 // Store is an in-memory data store for demo purposes.
