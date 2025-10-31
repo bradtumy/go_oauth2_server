@@ -195,7 +195,7 @@ func (s *authorizationServer) humanExtraClaims(h identity.Human) map[string]any 
 	return claims
 }
 
-func (s *authorizationServer) resolveAgent(ctx context.Context, clientID, requestedAgentID string, claim obo.ActClaim) (identity.Agent, error) {
+func (s *authorizationServer) resolveAgent(ctx context.Context, clientID, requestedAgentID string, claim obo.ActClaim, actorProvided bool) (identity.Agent, error) {
 	clientID = strings.TrimSpace(clientID)
 	requestedAgentID = strings.TrimSpace(requestedAgentID)
 	if claim.ClientID != "" && clientID != "" && !strings.EqualFold(claim.ClientID, clientID) {
@@ -219,6 +219,9 @@ func (s *authorizationServer) resolveAgent(ctx context.Context, clientID, reques
 		}
 		if agent, ok := s.identities.GetAgentByLabel(ctx, clientID, claim.Actor); ok {
 			return agent, nil
+		}
+		if actorProvided {
+			return identity.Agent{}, identity.ErrAgentNotFound
 		}
 	}
 	agents, err := s.identities.ListAgentsByClient(ctx, clientID)
@@ -563,7 +566,7 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 	agentIDParam := r.PostFormValue("agent_id")
-	agent, err := s.resolveAgent(r.Context(), client.ID, agentIDParam, actClaim)
+	agent, err := s.resolveAgent(r.Context(), client.ID, agentIDParam, actClaim, actorToken != "")
 	if err != nil {
 		status := http.StatusBadRequest
 		switch {
