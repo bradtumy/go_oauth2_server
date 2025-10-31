@@ -78,7 +78,10 @@ type resourceConfig struct {
 }
 
 func loadConfig() (*resourceConfig, error) {
-	issuer := getEnv("AS_ISSUER", "http://localhost:8080")
+	issuer := getEnv("ISSUER", "")
+	if issuer == "" {
+		issuer = getEnv("AS_ISSUER", "http://localhost:8080")
+	}
 	audience := getEnv("RS_AUDIENCE", "http://localhost:9090")
 	keyB64 := getEnv("AS_SIGNING_KEY_BASE64", "ZGV2LXNpZ25pbmcta2V5LTEyMzQ=")
 	key, err := base64.StdEncoding.DecodeString(keyB64)
