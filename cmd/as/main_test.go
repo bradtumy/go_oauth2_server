@@ -214,6 +214,42 @@ func TestTokenExchangeCapabilityDenied(t *testing.T) {
 	}
 }
 
+func TestTokenExchangeInvalidSubjectToken(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	if _, err := idStore.CreateHuman(ctx, identity.Human{Email: "dana@example.com", Name: "Dana"}); err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	form.Set("subject_token", "not-a-token")
+	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	form.Set("scope", "orders:export")
+	form.Set("client_id", srv.cfg.DefaultClientID)
+	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+
+	resp, err := http.PostForm(server.URL+"/token", form)
+	if err != nil {
+		t.Fatalf("obo request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, string(body))
+	}
+	var oauthErr map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got, want := oauthErr["error"], "invalid_grant"; got != want {
+		t.Fatalf("expected error %q, got %v", want, got)
+	}
+}
+
 func newTestServer(t *testing.T, identityStore identity.Store) (*authorizationServer, *httptest.Server) {
 	t.Helper()
 	cfg := &config.Config{
