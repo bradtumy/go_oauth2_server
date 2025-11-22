@@ -16,7 +16,9 @@ import (
 	"go_oauth2_server/internal/config"
 	"go_oauth2_server/internal/identity"
 	internaljwt "go_oauth2_server/internal/jwt"
+	"go_oauth2_server/internal/middleware"
 	"go_oauth2_server/internal/obo"
+	"go_oauth2_server/internal/router"
 	"go_oauth2_server/internal/store"
 	memstore "go_oauth2_server/internal/store/mem"
 )
@@ -354,13 +356,8 @@ func newTestServer(t *testing.T, identityStore identity.Store) (*authorizationSe
 	}
 
 	identityHandler := identity.NewHandler(identityStore, cfg.AdminToken)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
-	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
-	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
-	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
-	mux.HandleFunc("/register/agent", methodHandler(http.MethodPost, identityHandler.CreateAgent))
+	mux := router.SetupRoutes(srv, identityHandler)
 
-	server := httptest.NewServer(loggingMiddleware(mux))
+	server := httptest.NewServer(middleware.Logging(mux))
 	return srv, server
 }
