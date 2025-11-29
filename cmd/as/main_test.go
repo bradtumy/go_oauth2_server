@@ -16,7 +16,9 @@ import (
 	"go_oauth2_server/internal/config"
 	"go_oauth2_server/internal/identity"
 	internaljwt "go_oauth2_server/internal/jwt"
+	"go_oauth2_server/internal/middleware"
 	"go_oauth2_server/internal/obo"
+	"go_oauth2_server/internal/router"
 	"go_oauth2_server/internal/store"
 	memstore "go_oauth2_server/internal/store/mem"
 )
@@ -214,6 +216,73 @@ func TestTokenExchangeCapabilityDenied(t *testing.T) {
 	}
 }
 
+func TestTokenExchangeActorMismatch(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{Email: "eve@example.com", Name: "Eve"})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+	if _, err := idStore.CreateAgent(ctx, identity.Agent{Name: "Worker", ClientID: "client-xyz", AgentID: "worker", Capabilities: []string{"orders:export"}}); err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	subjectBody, _ := json.Marshal(map[string]string{"human_id": human.ID})
+	subjectResp, err := http.Post(server.URL+"/subject-assertion", "application/json", bytes.NewReader(subjectBody))
+	if err != nil {
+		t.Fatalf("subject assertion request: %v", err)
+	}
+	defer subjectResp.Body.Close()
+	if subjectResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 from subject assertion, got %d", subjectResp.StatusCode)
+	}
+	var subject map[string]any
+	if err := json.NewDecoder(subjectResp.Body).Decode(&subject); err != nil {
+		t.Fatalf("decode subject assertion: %v", err)
+	}
+	subjectToken, _ := subject["assertion"].(string)
+	if subjectToken == "" {
+		t.Fatal("missing subject assertion")
+	}
+
+	actorToken, _, err := srv.signer.IssueAccessWithClaims(ctx, "agent:notfound", srv.cfg.DefaultClientID, "", map[string]any{"actor": "agent:notfound"})
+	if err != nil {
+		t.Fatalf("issue actor token: %v", err)
+	}
+
+	authDetails := `[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:123"]}}]`
+	form := url.Values{}
+	form.Set("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange")
+	form.Set("subject_token", subjectToken)
+	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
+	form.Set("actor_token", actorToken)
+	form.Set("actor_token_type", "urn:ietf:params:oauth:token-type:jwt")
+	form.Set("audience", srv.cfg.Audience)
+	form.Set("client_id", srv.cfg.DefaultClientID)
+	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+	form.Set("authorization_details", authDetails)
+
+	resp, err := http.PostForm(server.URL+"/token", form)
+	if err != nil {
+		t.Fatalf("obo request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 400, got %d: %s", resp.StatusCode, string(body))
+	}
+	var oauthErr map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&oauthErr); err != nil {
+		t.Fatalf("decode error response: %v", err)
+	}
+	if got, want := oauthErr["error"], "invalid_request"; got != want {
+		t.Fatalf("expected error %q, got %v", want, got)
+	}
+}
+
 func TestTokenExchangeInvalidSubjectToken(t *testing.T) {
 	ctx := context.Background()
 	idStore := memstore.New()
@@ -287,13 +356,8 @@ func newTestServer(t *testing.T, identityStore identity.Store) (*authorizationSe
 	}
 
 	identityHandler := identity.NewHandler(identityStore, cfg.AdminToken)
-	mux := http.NewServeMux()
-	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
-	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
-	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
-	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
-	mux.HandleFunc("/register/agent", methodHandler(http.MethodPost, identityHandler.CreateAgent))
+	mux := router.SetupRoutes(srv, identityHandler)
 
-	server := httptest.NewServer(loggingMiddleware(mux))
+	server := httptest.NewServer(middleware.Logging(mux))
 	return srv, server
 }
