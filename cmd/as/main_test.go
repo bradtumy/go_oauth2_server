@@ -55,6 +55,11 @@ s8Db464pzs9t0Z/+RowMN8nMuwXoybwSJYCdm83GEevJoZ4av5gaJCvIEjGHNCul
 odOEQaR0ILGMQJZmpfvekDyK
 -----END PRIVATE KEY-----`
 
+const (
+	testClientID     = "client-xyz"
+	testClientSecret = "secret-xyz"
+)
+
 func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 	ctx := context.Background()
 	idStore := memstore.New()
@@ -67,7 +72,7 @@ func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 	defer server.Close()
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(srv.cfg.DefaultClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
 	resp, err := client.Get(authURL)
 	if err != nil {
 		t.Fatalf("authorize request: %v", err)
@@ -90,9 +95,9 @@ func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", "http://localhost/callback")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
-	req, err := http.NewRequest(http.MethodPost, server.URL+"/token", strings.NewReader(form.Encode()))
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/oauth2/token", strings.NewReader(form.Encode()))
 	if err != nil {
 		t.Fatalf("create token request: %v", err)
 	}
@@ -164,11 +169,11 @@ func TestTokenExchangeWithRegisteredIdentities(t *testing.T) {
 	form.Set("subject_token", subjectToken)
 	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	form.Set("audience", srv.cfg.Audience)
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
 	form.Set("authorization_details", authDetails)
 	form.Set("agent_id", agent.AgentID)
-	resp, err := http.PostForm(server.URL+"/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("obo request: %v", err)
 	}
@@ -234,10 +239,10 @@ func TestTokenExchangeCapabilityDenied(t *testing.T) {
 	form.Set("subject_token", subjectToken)
 	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	form.Set("audience", srv.cfg.Audience)
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
 	form.Set("authorization_details", authDetails)
-	resp, err := http.PostForm(server.URL+"/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("obo request: %v", err)
 	}
@@ -255,7 +260,7 @@ func TestTokenExchangeInvalidSubjectToken(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	srv, server := newTestServer(t, idStore)
+	_, server := newTestServer(t, idStore)
 	defer server.Close()
 
 	form := url.Values{}
@@ -263,10 +268,10 @@ func TestTokenExchangeInvalidSubjectToken(t *testing.T) {
 	form.Set("subject_token", "not-a-token")
 	form.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	form.Set("scope", "orders:export")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
 
-	resp, err := http.PostForm(server.URL+"/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("obo request: %v", err)
 	}
@@ -296,7 +301,7 @@ func TestRedirectURIMismatch(t *testing.T) {
 	defer server.Close()
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape("client-xyz"), url.QueryEscape("http://localhost/other"), url.QueryEscape(human.ID))
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/other"), url.QueryEscape(human.ID))
 	resp, err := client.Get(authURL)
 	if err != nil {
 		t.Fatalf("authorize request: %v", err)
@@ -315,11 +320,11 @@ func TestAuthorizationCodeOneTimeUse(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	srv, server := newTestServer(t, idStore)
+	_, server := newTestServer(t, idStore)
 	defer server.Close()
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(srv.cfg.DefaultClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
 	resp, err := client.Get(authURL)
 	if err != nil {
 		t.Fatalf("authorize request: %v", err)
@@ -339,15 +344,15 @@ func TestAuthorizationCodeOneTimeUse(t *testing.T) {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", "http://localhost/callback")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
-	resp, err = http.PostForm(server.URL+"/token", form)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
 	resp.Body.Close()
 
-	resp, err = http.PostForm(server.URL+"/token", form)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("second token request: %v", err)
 	}
@@ -366,22 +371,20 @@ func TestAuthorizationCodeExpires(t *testing.T) {
 	}
 
 	cfg := &config.Config{
-		Issuer:              "http://test-as",
-		Audience:            "http://test-rs",
-		SigningKeyPEM:       []byte(testSigningKeyPEM),
-		SigningKeyID:        "test-key",
-		DefaultClientID:     "client-xyz",
-		DefaultClientSecret: "secret-xyz",
-		CodeTTL:             10 * time.Millisecond,
-		AccessTokenTTL:      time.Hour,
-		RefreshTokenTTL:     time.Hour,
-		OBOTokenTTL:         time.Minute,
+		Issuer:          "http://test-as",
+		Audience:        "http://test-rs",
+		SigningKeyPEM:   []byte(testSigningKeyPEM),
+		SigningKeyID:    "test-key",
+		CodeTTL:         10 * time.Millisecond,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: time.Hour,
+		OBOTokenTTL:     time.Minute,
 	}
-	srv, server := newTestServerWithConfig(t, idStore, cfg)
+	_, server := newTestServerWithConfig(t, idStore, cfg)
 	defer server.Close()
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(srv.cfg.DefaultClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
 	resp, err := client.Get(authURL)
 	if err != nil {
 		t.Fatalf("authorize request: %v", err)
@@ -403,9 +406,9 @@ func TestAuthorizationCodeExpires(t *testing.T) {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", "http://localhost/callback")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
-	resp, err = http.PostForm(server.URL+"/token", form)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -427,10 +430,10 @@ func TestJWKSAndJWTClaims(t *testing.T) {
 
 	form := url.Values{}
 	form.Set("grant_type", "client_credentials")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
 	form.Set("scope", "orders:export")
-	resp, err := http.PostForm(server.URL+"/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -494,7 +497,7 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 	defer server.Close()
 
 	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=%s&human_id=%s", server.URL, url.QueryEscape(srv.cfg.DefaultClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape("orders:read"), url.QueryEscape(human.ID))
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=%s&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape("orders:read"), url.QueryEscape(human.ID))
 	resp, err := client.Get(authURL)
 	if err != nil {
 		t.Fatalf("authorize request: %v", err)
@@ -514,9 +517,9 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 	form.Set("grant_type", "authorization_code")
 	form.Set("code", code)
 	form.Set("redirect_uri", "http://localhost/callback")
-	form.Set("client_id", srv.cfg.DefaultClientID)
-	form.Set("client_secret", srv.cfg.DefaultClientSecret)
-	resp, err = http.PostForm(server.URL+"/token", form)
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -535,10 +538,10 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 	exchange.Set("subject_token", subjectToken)
 	exchange.Set("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")
 	exchange.Set("audience", srv.cfg.Audience)
-	exchange.Set("client_id", srv.cfg.DefaultClientID)
-	exchange.Set("client_secret", srv.cfg.DefaultClientSecret)
+	exchange.Set("client_id", testClientID)
+	exchange.Set("client_secret", testClientSecret)
 	exchange.Set("scope", "orders:export")
-	resp, err = http.PostForm(server.URL+"/token", exchange)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", exchange)
 	if err != nil {
 		t.Fatalf("token exchange: %v", err)
 	}
@@ -552,29 +555,38 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 func newTestServer(t *testing.T, identityStore identity.Store) (*authorizationServer, *httptest.Server) {
 	t.Helper()
 	cfg := &config.Config{
-		Issuer:              "http://test-as",
-		Audience:            "http://test-rs",
-		SigningKeyPEM:       []byte(testSigningKeyPEM),
-		SigningKeyID:        "test-key",
-		DefaultClientID:     "client-xyz",
-		DefaultClientSecret: "secret-xyz",
-		CodeTTL:             time.Minute,
-		AccessTokenTTL:      time.Hour,
-		RefreshTokenTTL:     time.Hour,
-		OBOTokenTTL:         time.Minute,
+		Issuer:          "http://test-as",
+		Audience:        "http://test-rs",
+		SigningKeyPEM:   []byte(testSigningKeyPEM),
+		SigningKeyID:    "test-key",
+		CodeTTL:         time.Minute,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: time.Hour,
+		OBOTokenTTL:     time.Minute,
 	}
 	return newTestServerWithConfig(t, identityStore, cfg)
 }
 
 func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *config.Config) (*authorizationServer, *httptest.Server) {
-	defaultClient := store.Client{
-		ID:           cfg.DefaultClientID,
-		Secret:       cfg.DefaultClientSecret,
-		RedirectURI:  "http://localhost/callback",
-		Audience:     cfg.Audience,
-		DefaultScope: "openid",
+	oauthStore := store.New()
+	clientStore := memstore.NewClientStore()
+	_, err := clientStore.CreateClient(context.Background(), store.Client{
+		ID:           testClientID,
+		Type:         store.ClientTypeConfidential,
+		Secret:       testClientSecret,
+		RedirectURIs: []string{"http://localhost/callback"},
+		GrantTypes: []string{
+			store.GrantAuthorizationCode,
+			store.GrantRefreshToken,
+			store.GrantClientCredentials,
+			store.GrantTokenExchange,
+		},
+		Scopes:    []string{"openid", "orders:read", "orders:export"},
+		Audiences: []string{cfg.Audience},
+	})
+	if err != nil {
+		t.Fatalf("seed client: %v", err)
 	}
-	oauthStore := store.New(defaultClient)
 	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.SigningKeyID, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
 	if err != nil {
 		t.Fatalf("init signer: %v", err)
@@ -584,6 +596,7 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	srv := &authorizationServer{
 		cfg:                cfg,
 		store:              oauthStore,
+		clients:            clientStore,
 		signer:             signer,
 		oboService:         oboService,
 		identities:         identityStore,
@@ -597,6 +610,8 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	mux.HandleFunc("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
 	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
 	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.HandleFunc("/oauth2/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
+	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
 	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
 	mux.HandleFunc("/register/agent", methodHandler(http.MethodPost, identityHandler.CreateAgent))

@@ -3,18 +3,20 @@ set -euo pipefail
 
 AS_BASE=${AS_BASE:-http://localhost:8080}
 RS_BASE=${RS_BASE:-http://localhost:9090}
-CLIENT_ID=${AS_DEFAULT_CLIENT_ID:-client-xyz}
-CLIENT_SECRET=${AS_DEFAULT_CLIENT_SECRET:-secret-xyz}
-REDIRECT_URI=${REDIRECT_URI:-http://localhost:8081/callback}
+HUMAN_CLIENT_ID=${HUMAN_CLIENT_ID:-human-web}
+AGENT_CLIENT_ID=${AGENT_CLIENT_ID:-agent-cli}
+AGENT_CLIENT_SECRET=${AGENT_CLIENT_SECRET:-agent-cli-secret}
+REDIRECT_URI=${REDIRECT_URI:-http://localhost:5555/callback}
 USER_ID=${USER_ID:-user:123}
 ACCOUNT_ID=${ACCOUNT_ID:-acct:abc}
 
 printf "[1/4] Requesting authorization code...\n" >&2
-AUTH_RES=$(curl -si -G -H "X-Demo-User: ${USER_ID}" "${AS_BASE}/authorize" \
+AUTH_RES=$(curl -si -G "${AS_BASE}/oauth2/authorize" \
   --data-urlencode "response_type=code" \
-  --data-urlencode "client_id=${CLIENT_ID}" \
+  --data-urlencode "client_id=${HUMAN_CLIENT_ID}" \
   --data-urlencode "redirect_uri=${REDIRECT_URI}" \
-  --data-urlencode "scope=orders:export" \
+  --data-urlencode "scope=tickets.read" \
+  --data-urlencode "human_id=${USER_ID}" \
   --data-urlencode "state=test")
 CODE=$(AUTH_RES="$AUTH_RES" python - <<'PY'
 import os
@@ -37,18 +39,18 @@ PY
 )
 
 printf "[2/4] Exchanging code for user token...\n" >&2
-TOKEN_JSON=$(curl -s -X POST "${AS_BASE}/token" \
-  -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+TOKEN_JSON=$(curl -s -X POST "${AS_BASE}/oauth2/token" \
+  -u "${HUMAN_CLIENT_ID}:" \
   -d "grant_type=authorization_code" \
   --data-urlencode "code=${CODE}" \
   --data-urlencode "redirect_uri=${REDIRECT_URI}")
 USER_TOKEN=$(printf '%s' "$TOKEN_JSON" | python -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
 
 printf "[3/4] Minting actor assertion and performing token exchange...\n" >&2
-ACTOR_ASSERTION=$(go run ./tools/mint_assertion -actor agent:ingestor-42 -client "${CLIENT_ID}")
+ACTOR_ASSERTION=$(go run ./tools/mint_assertion -actor agent:ingestor-42 -client "${AGENT_CLIENT_ID}")
 RAR='[{"type":"agent-action","locations":["'"${RS_BASE}"'"],"actions":["orders:export"],"constraints":{"resource_ids":["'"${ACCOUNT_ID}"'"],"time_limit_sec":900,"max_records":1000,"purpose":"customer_export"}}]'
-OBO_JSON=$(curl -s -X POST "${AS_BASE}/token" \
-  -u "${CLIENT_ID}:${CLIENT_SECRET}" \
+OBO_JSON=$(curl -s -X POST "${AS_BASE}/oauth2/token" \
+  -u "${AGENT_CLIENT_ID}:${AGENT_CLIENT_SECRET}" \
   -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
   --data-urlencode "subject_token=${USER_TOKEN}" \
   -d "subject_token_type=urn:ietf:params:oauth:token-type:access_token" \

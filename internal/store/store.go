@@ -6,57 +6,38 @@ import (
 	"time"
 )
 
-// Client represents an OAuth client registration.
-type Client struct {
-	ID           string
-	Secret       string
-	RedirectURI  string
-	Audience     string
-	DefaultScope string
-}
-
 // AuthorizationCode represents an authorization code grant.
 type AuthorizationCode struct {
-        Code        string
-        ClientID    string
-        HumanID     string
-        RedirectURI string
-        Scope       string
-        ExpiresAt   time.Time
+	Code        string
+	ClientID    string
+	HumanID     string
+	RedirectURI string
+	Scope       string
+	ExpiresAt   time.Time
 }
 
 // RefreshToken represents a refresh token record.
 type RefreshToken struct {
-        Token     string
-        ClientID  string
-        HumanID   string
-        Scope     string
-        ExpiresAt time.Time
+	Token     string
+	ClientID  string
+	HumanID   string
+	Scope     string
+	ExpiresAt time.Time
 }
 
 // Store is an in-memory data store for demo purposes.
 type Store struct {
 	mu            sync.Mutex
-	clients       map[string]Client
 	codes         map[string]AuthorizationCode
 	refreshTokens map[string]RefreshToken
 }
 
-// New creates a new Store with default data.
-func New(defaultClient Client) *Store {
+// New creates a new Store.
+func New() *Store {
 	return &Store{
-		clients:       map[string]Client{defaultClient.ID: defaultClient},
 		codes:         make(map[string]AuthorizationCode),
 		refreshTokens: make(map[string]RefreshToken),
 	}
-}
-
-// GetClient returns a client by ID.
-func (s *Store) GetClient(id string) (Client, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	client, ok := s.clients[id]
-	return client, ok
 }
 
 // SaveCode stores an authorization code.

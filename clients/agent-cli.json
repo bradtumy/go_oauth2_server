@@ -1,0 +1,14 @@
+{
+  "client_id": "agent-cli",
+  "client_type": "confidential",
+  "client_secret": "agent-cli-secret",
+  "grant_types": [
+    "token_exchange",
+    "client_credentials"
+  ],
+  "scopes": [
+    "tickets.read",
+    "tickets.write",
+    "refunds.create"
+  ]
+}

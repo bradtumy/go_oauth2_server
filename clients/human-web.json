@@ -1,0 +1,14 @@
+{
+  "client_id": "human-web",
+  "client_type": "public",
+  "redirect_uris": [
+    "http://localhost:5555/callback"
+  ],
+  "grant_types": [
+    "authorization_code",
+    "refresh_token"
+  ],
+  "scopes": [
+    "tickets.read"
+  ]
+}
