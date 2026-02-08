@@ -61,12 +61,12 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 # Install dependencies
 go mod tidy
 
-# Start the authorisation server
+# Start the authorisation server (AS)
 ISSUER=http://localhost:8080 \
 RS_AUDIENCE=http://localhost:9090 \
 go run ./cmd/as
 
-# In another terminal start the resource server
+# In another terminal start the resource server (RS)
 RS_AUDIENCE=http://localhost:9090 \
 AS_JWKS_URL=http://localhost:8080/.well-known/jwks.json \
 go run ./cmd/rs
@@ -130,7 +130,40 @@ Client registrations are managed via the admin API bound to `127.0.0.1` (default
 - `PUT    /admin/clients/{client_id}`
 - `DELETE /admin/clients/{client_id}`
 
+Set `AS_ADMIN_TOKEN` before starting the AS so the admin API and registration endpoints require auth:
+
+```bash
+export AS_ADMIN_TOKEN=dev-admin-token
+go run ./cmd/as
+```
+
+Example client registry calls:
+
+```bash
+# List clients
+curl -sS http://127.0.0.1:8082/admin/clients \
+  -H "Authorization: Bearer ${AS_ADMIN_TOKEN}" | jq .
+
+# Create a client
+curl -sS -X POST http://127.0.0.1:8082/admin/clients \
+  -H "Authorization: Bearer ${AS_ADMIN_TOKEN}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "agent-cli",
+    "client_secret": "agent-cli-secret",
+    "name": "Agent CLI",
+    "grant_types": ["client_credentials", "authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:token-exchange"],
+    "redirect_uris": ["http://localhost:5555/callback"]
+  }' | jq .
+```
+
 ### 3. Authorisation code flow
+
+High-level steps:
+
+1. Redirect the user to `/oauth2/authorize` with `response_type=code`.
+2. Capture the `code` from the redirect URI.
+3. Exchange the code at `/oauth2/token` for access/refresh tokens.
 
 ```bash
 # Launch the authorisation request (use either human_id or email)
@@ -171,6 +204,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
 ```
 
+- The server supports token exchange (RFC 8693), so you can use the above request to trade a subject token for an on-behalf-of access token.
 - The `subject_token` must resolve to a registered human.
 - The authenticated client (optionally overridden via `agent_id`) must resolve to a registered agent with matching capabilities.
 - The returned OBO token contains `sub` (human ID) and an `act` claim whose `actor` value equals the registered agent ID.
@@ -230,6 +264,17 @@ AS_CLIENTS_DB=./data/clients.db ./scripts/seed_clients.sh
 ```
 
 The seed files live in `clients/*.json`. Update those files (or add new ones) to register additional clients.
+
+Example client credentials grant:
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret' \
+  -d 'scope=orders:read' | jq .
+```
 
 ### Postman collection
 
