@@ -11,9 +11,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"go_oauth2_server/internal/admin"
 	"go_oauth2_server/internal/config"
 	"go_oauth2_server/internal/identity"
 	internaljwt "go_oauth2_server/internal/jwt"
@@ -21,6 +24,7 @@ import (
 	"go_oauth2_server/internal/random"
 	"go_oauth2_server/internal/store"
 	memstore "go_oauth2_server/internal/store/mem"
+	sqlstore "go_oauth2_server/internal/store/sqlite"
 )
 
 func main() {
@@ -31,16 +35,13 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	defaultClient := store.Client{
-		ID:           cfg.DefaultClientID,
-		Secret:       cfg.DefaultClientSecret,
-		RedirectURI:  "http://localhost:8081/callback",
-		Audience:     cfg.Audience,
-		DefaultScope: "orders:export",
-	}
 	logConfiguration(cfg)
 
-	st := store.New(defaultClient)
+	st := store.New()
+	clientStore, err := buildClientStore(cfg)
+	if err != nil {
+		log.Fatalf("init client store: %v", err)
+	}
 
 	identityStore := memstore.New()
 	if cfg.SeedIdentitiesPath != "" {
@@ -58,6 +59,7 @@ func main() {
 	srv := &authorizationServer{
 		cfg:                cfg,
 		store:              st,
+		clients:            clientStore,
 		signer:             signer,
 		oboService:         oboService,
 		identities:         identityStore,
@@ -75,6 +77,8 @@ func main() {
 	mux.HandleFunc("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
 	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
 	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.HandleFunc("/oauth2/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
+	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
 	mux.HandleFunc("/mint-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
@@ -107,6 +111,18 @@ func main() {
 		addr = v
 	}
 
+	adminHandler := admin.NewClientHandler(clientStore, cfg.AdminToken)
+	adminMux := http.NewServeMux()
+	adminMux.HandleFunc("/admin/clients", adminHandler.HandleClients)
+	adminMux.HandleFunc("/admin/clients/", adminHandler.HandleClient)
+
+	go func() {
+		log.Printf("Admin API listening on %s", cfg.AdminAddr)
+		if err := http.ListenAndServe(cfg.AdminAddr, loggingMiddleware(adminMux)); err != nil {
+			log.Fatalf("admin listen: %v", err)
+		}
+	}()
+
 	log.Printf("Authorization server listening on %s", addr)
 	if err := http.ListenAndServe(addr, loggingMiddleware(mux)); err != nil {
 		log.Fatalf("listen: %v", err)
@@ -116,6 +132,7 @@ func main() {
 type authorizationServer struct {
 	cfg                *config.Config
 	store              *store.Store
+	clients            store.ClientStore
 	signer             *internaljwt.Signer
 	oboService         *obo.Service
 	identities         identity.Store
@@ -253,20 +270,29 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		return
 	}
 	clientID := q.Get("client_id")
-	client, ok := s.store.GetClient(clientID)
+	client, ok, err := s.clients.GetClient(r.Context(), clientID)
+	if err != nil {
+		writeOAuthError(w, http.StatusInternalServerError, "server_error", "client lookup failed")
+		return
+	}
 	if !ok {
 		writeOAuthError(w, http.StatusBadRequest, "unauthorized_client", "unknown client")
 		return
 	}
-	redirectURI := q.Get("redirect_uri")
-	if client.RedirectURI == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri required")
+	if !clientAllowsGrant(client, store.GrantAuthorizationCode) {
+		writeOAuthError(w, http.StatusBadRequest, "unauthorized_client", "authorization_code not allowed")
 		return
 	}
+	redirectURI := strings.TrimSpace(q.Get("redirect_uri"))
 	if redirectURI == "" {
-		redirectURI = client.RedirectURI
+		if len(client.RedirectURIs) == 1 {
+			redirectURI = client.RedirectURIs[0]
+		} else {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri required")
+			return
+		}
 	}
-	if redirectURI != client.RedirectURI {
+	if !redirectURIMatch(client.RedirectURIs, redirectURI) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri mismatch")
 		return
 	}
@@ -287,7 +313,11 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 	}
 	scope := q.Get("scope")
 	if scope == "" {
-		scope = client.DefaultScope
+		scope = strings.Join(client.Scopes, " ")
+	}
+	if !scopeSubsetList(scope, client.Scopes) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
+		return
 	}
 
 	code := random.NewID()
@@ -323,13 +353,12 @@ func (s *authorizationServer) handleToken(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	client, err := s.authenticateClient(r)
+	grantType := r.PostFormValue("grant_type")
+	client, err := s.authenticateClient(r, grantType)
 	if err != nil {
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
-
-	grantType := r.PostFormValue("grant_type")
 	switch grantType {
 	case "authorization_code":
 		s.handleAuthorizationCodeGrant(w, r, client)
@@ -414,6 +443,10 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
 		return
 	}
+	if !scopeSubsetList(record.Scope, client.Scopes) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
+		return
+	}
 	human, err := s.lookupHumanByID(r.Context(), record.HumanID)
 	if err != nil {
 		status := http.StatusBadRequest
@@ -461,6 +494,10 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown refresh token")
 		return
 	}
+	if !scopeSubsetList(rt.Scope, client.Scopes) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
+		return
+	}
 	if time.Now().After(rt.ExpiresAt) {
 		s.store.DeleteRefreshToken(token)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
@@ -491,7 +528,11 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 func (s *authorizationServer) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
 	scope := r.PostFormValue("scope")
 	if scope == "" {
-		scope = client.DefaultScope
+		scope = strings.Join(client.Scopes, " ")
+	}
+	if !scopeSubsetList(scope, client.Scopes) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
+		return
 	}
 	subject := "client:" + client.ID
 	access, expiresIn, err := s.signer.IssueAccess(r.Context(), subject, client.ID, scope)
@@ -525,6 +566,10 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		// OBO tokens target the resource server as expected.
 		audience = s.cfg.Audience
 	}
+	if len(client.Audiences) > 0 && !stringInList(client.Audiences, audience) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_target", "audience not allowed")
+		return
+	}
 
 	rarRaw := r.PostFormValue("authorization_details")
 	rar, err := obo.ParseRAR(rarRaw)
@@ -555,6 +600,10 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 	requestedScope := strings.TrimSpace(r.PostFormValue("scope"))
+	if requestedScope != "" && !scopeSubsetList(requestedScope, client.Scopes) {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
+		return
+	}
 	if requestedScope != "" {
 		if !scopeSubset(requestedScope, subjectClaims["scope"]) {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope exceeds subject token scope")
@@ -634,7 +683,7 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 	})
 }
 
-func (s *authorizationServer) authenticateClient(r *http.Request) (store.Client, error) {
+func (s *authorizationServer) authenticateClient(r *http.Request, grantType string) (store.Client, error) {
 	header := r.Header.Get("Authorization")
 	var clientID, clientSecret string
 	if header != "" && strings.HasPrefix(strings.ToLower(header), "basic ") {
@@ -656,12 +705,21 @@ func (s *authorizationServer) authenticateClient(r *http.Request) (store.Client,
 	if clientID == "" {
 		return store.Client{}, errors.New("client_id required")
 	}
-	client, ok := s.store.GetClient(clientID)
+	client, ok, err := s.clients.GetClient(r.Context(), clientID)
+	if err != nil {
+		return store.Client{}, errors.New("client lookup failed")
+	}
 	if !ok {
 		return store.Client{}, errors.New("unknown client")
 	}
-	if client.Secret != "" && client.Secret != clientSecret {
-		return store.Client{}, errors.New("invalid client secret")
+	normalizedGrant := store.NormalizeGrantType(grantType)
+	if normalizedGrant != "" && !clientAllowsGrant(client, normalizedGrant) {
+		return store.Client{}, errors.New("unauthorized client")
+	}
+	if client.Type == store.ClientTypeConfidential {
+		if clientSecret == "" || client.Secret != clientSecret {
+			return store.Client{}, errors.New("invalid client secret")
+		}
 	}
 	return client, nil
 }
@@ -739,18 +797,81 @@ func loadDotEnv() {
 }
 
 func logConfiguration(cfg *config.Config) {
-	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s default_client_id=%s default_client_secret=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.DefaultClientID, maskSecret(cfg.DefaultClientSecret), cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s client_store=%s clients_db=%s admin_addr=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.ClientStoreDriver, cfg.ClientDBPath, cfg.AdminAddr, cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
 }
 
-func maskSecret(secret string) string {
-	secret = strings.TrimSpace(secret)
-	if secret == "" {
-		return ""
+func buildClientStore(cfg *config.Config) (store.ClientStore, error) {
+	switch strings.ToLower(strings.TrimSpace(cfg.ClientStoreDriver)) {
+	case "memory", "mem", "in-memory":
+		return memstore.NewClientStore(), nil
+	case "sqlite", "":
+		if _, err := exec.LookPath("sqlite3"); err != nil {
+			return nil, fmt.Errorf("sqlite3 not found: %w", err)
+		}
+		if err := ensureDir(filepath.Dir(cfg.ClientDBPath)); err != nil {
+			return nil, err
+		}
+		return sqlstore.NewClientStore(cfg.ClientDBPath)
+	default:
+		return nil, fmt.Errorf("unsupported client store driver %q", cfg.ClientStoreDriver)
 	}
-	if len(secret) <= 4 {
-		return "****"
+}
+
+func ensureDir(path string) error {
+	if path == "." || path == "" {
+		return nil
 	}
-	return secret[:2] + strings.Repeat("*", len(secret)-4) + secret[len(secret)-2:]
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+	return nil
+}
+
+func clientAllowsGrant(client store.Client, grantType string) bool {
+	for _, grant := range client.GrantTypes {
+		if grant == grantType {
+			return true
+		}
+	}
+	return false
+}
+
+func redirectURIMatch(allowed []string, requested string) bool {
+	for _, uri := range allowed {
+		if uri == requested {
+			return true
+		}
+	}
+	return false
+}
+
+func scopeSubsetList(requested string, allowed []string) bool {
+	req := strings.Fields(strings.TrimSpace(requested))
+	if len(req) == 0 {
+		return true
+	}
+	if len(allowed) == 0 {
+		return false
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, scope := range allowed {
+		allowedSet[scope] = struct{}{}
+	}
+	for _, scope := range req {
+		if _, ok := allowedSet[scope]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+func stringInList(list []string, value string) bool {
+	for _, entry := range list {
+		if entry == value {
+			return true
+		}
+	}
+	return false
 }
 
 func scopeSubset(requested string, subjectScope any) bool {

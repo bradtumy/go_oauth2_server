@@ -37,9 +37,10 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 |                      |           |                          |
 | • /register/human    |           | • /accounts/{id}/orders/ |
 | • /register/agent    |           |   export                 |
-| • /authorize         |           | • Validates JWT, perm,   |
-| • /token             |           |   authorization_details  |
+| • /oauth2/authorize  |           | • Validates JWT, perm,   |
+| • /oauth2/token      |           |   authorization_details  |
 | • /subject-assertion |           |                          |
+| • /admin/clients     |           |                          |
 +----------------------+           +--------------------------+
 ```
 
@@ -50,6 +51,7 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 
 - Go **1.24+**
 - `curl`
+- `sqlite3` (or set `AS_CLIENT_STORE=memory`)
 - Optional: Docker & Docker Compose v2
 - Optional: `make`
 
@@ -87,7 +89,7 @@ Set additional environment variables by editing `docker-compose.yml` or creating
 
 ## Identity Registration & End-to-End OAuth/OBO with Registered Identities
 
-Every OAuth/OBO flow relies on registered identities. The built-in APIs store data in an in-memory, thread-safe data store. Optionally protect the registration endpoints by setting `ADMIN_TOKEN` and sending `X-Admin-Token` headers.
+Every OAuth/OBO flow relies on registered identities. The built-in APIs store data in an in-memory, thread-safe data store. Optionally protect the registration endpoints by setting `AS_ADMIN_TOKEN` (or `ADMIN_TOKEN`) and sending `X-Admin-Token` headers.
 
 ### 1. Run the services
 
@@ -108,7 +110,7 @@ curl -sS -X POST http://localhost:8080/register/human \
 # Create an agent (client_id must match your OAuth client)
 curl -sS -X POST http://localhost:8080/register/agent \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id":"ingestor-42","name":"Data Ingestor","client_id":"client-xyz","capabilities":["orders:read","orders:export"],"tenant_id":"default"}' | jq .
+  -d '{"agent_id":"ingestor-42","name":"Data Ingestor","client_id":"agent-cli","capabilities":["orders:read","orders:export"],"tenant_id":"default"}' | jq .
 ```
 
 Optional administrative helpers:
@@ -118,20 +120,29 @@ curl -sS http://localhost:8080/humans | jq .
 curl -sS http://localhost:8080/agents | jq .
 ```
 
+### Admin client registry
+
+Client registrations are managed via the admin API bound to `127.0.0.1` (default `127.0.0.1:8082`). Set `AS_ADMIN_TOKEN` and include `Authorization: Bearer <token>` when calling:
+
+- `POST   /admin/clients`
+- `GET    /admin/clients`
+- `GET    /admin/clients/{client_id}`
+- `PUT    /admin/clients/{client_id}`
+- `DELETE /admin/clients/{client_id}`
+
 ### 3. Authorisation code flow
 
 ```bash
 # Launch the authorisation request (use either human_id or email)
-open "http://localhost:8080/authorize?response_type=code&client_id=client-xyz&redirect_uri=http://localhost:8081/cb&scope=openid&email=alice@example.com"
+open "http://localhost:8080/oauth2/authorize?response_type=code&client_id=human-web&redirect_uri=http://localhost:5555/callback&scope=tickets.read&email=alice@example.com"
 
 # Exchange the code for tokens
-curl -sS -X POST http://localhost:8080/token \
+curl -sS -X POST http://localhost:8080/oauth2/token \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -d 'grant_type=authorization_code' \
   -d 'code=<CODE_FROM_REDIRECT>' \
-  -d 'client_id=client-xyz' \
-  -d 'client_secret=secret-xyz' \
-  -d 'redirect_uri=http://localhost:8081/cb' | jq .
+  -d 'client_id=human-web' \
+  -d 'redirect_uri=http://localhost:5555/callback' | jq .
 ```
 
 The access token’s `sub` claim equals the registered human ID, and includes `email`, `name`, and `tenant_id` claims.
@@ -149,14 +160,14 @@ Subject assertions are short-lived JWTs (`iss = aud =` authorisation server) use
 ### 5. Perform RFC 8693 token exchange
 
 ```bash
-curl -sS -X POST http://localhost:8080/token \
+curl -sS -X POST http://localhost:8080/oauth2/token \
   -H 'Content-Type: application/x-www-form-urlencoded' \
   -d 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
   -d "subject_token=<SUBJECT_ASSERTION_OR_ACCESS_TOKEN>" \
   -d 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
   -d 'audience=http://localhost:9090' \
-  -d 'client_id=client-xyz' \
-  -d 'client_secret=secret-xyz' \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret' \
   --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
 ```
 
@@ -173,7 +184,7 @@ curl -sS -H "Authorization: Bearer <OBO_ACCESS_TOKEN>" \
 
 ### 7. Negative tests
 
-- Request `/authorize` without `human_id`/`email` → `400 invalid_request`.
+- Request `/oauth2/authorize` without `human_id`/`email` → `400 invalid_request`.
 - Perform token exchange with an unknown agent or mismatched `client_id` → `400 invalid_request`.
 - Request OBO permissions that the agent is not entitled to → `403 invalid_request` with `no permissions` message.
 
@@ -194,7 +205,7 @@ Bootstrap demo data by creating a JSON file and pointing `SEED_IDENTITIES_JSON` 
     {
       "agent_id": "ingestor-42",
       "name": "Data Ingestor",
-      "client_id": "client-xyz",
+      "client_id": "agent-cli",
       "capabilities": ["orders:read", "orders:export"],
       "tenant_id": "default"
     }
@@ -207,6 +218,18 @@ SEED_IDENTITIES_JSON=./data/seed.json go run ./cmd/as
 ```
 
 When using Docker Compose, mount the file and set the environment variable in `docker-compose.yml`.
+
+### Seeding clients
+
+Client registrations live in SQLite by default. Seed the demo clients with:
+
+```bash
+make seed
+# or
+AS_CLIENTS_DB=./data/clients.db ./scripts/seed_clients.sh
+```
+
+The seed files live in `clients/*.json`. Update those files (or add new ones) to register additional clients.
 
 ### Postman collection
 
@@ -248,7 +271,7 @@ Import the following collection and set the environment variables `BASE_URL`, `C
       "request": {
         "method": "POST",
         "header": [{"key": "Content-Type", "value": "application/x-www-form-urlencoded"}],
-        "url": "{{BASE_URL}}/token",
+        "url": "{{BASE_URL}}/oauth2/token",
         "body": {
           "mode": "urlencoded",
           "urlencoded": [
@@ -281,11 +304,13 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 | ----------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------- |
 | `ISSUER`                      | Issuer used in all minted tokens                                                             | `http://localhost:8080`         |
 | `RS_AUDIENCE`                 | Audience for access and OBO tokens                                                           | `http://localhost:9090`         |
-| `ADMIN_TOKEN`                 | Optional shared secret that gates `/register/*` endpoints (`X-Admin-Token` header required) | unset                           |
+| `AS_ADMIN_TOKEN`              | Shared secret that gates `/register/*` (`X-Admin-Token`) and `/admin/*` (`Authorization: Bearer`) endpoints | unset          |
+| `ADMIN_TOKEN`                 | Legacy alias for `AS_ADMIN_TOKEN`                                                          | unset                           |
 | `ALLOW_LEGACY_HARDCODED`      | Set to `true` to allow legacy hard-coded users/agents (development only)                    | `false`                         |
 | `SEED_IDENTITIES_JSON`        | Path to a JSON file containing initial humans/agents (`{"humans":[],"agents":[]}`)       | unset                           |
-| `AS_DEFAULT_CLIENT_ID`        | Default OAuth client ID                                                                      | `client-xyz`                    |
-| `AS_DEFAULT_CLIENT_SECRET`    | Default OAuth client secret                                                                  | `secret-xyz`                    |
+| `AS_CLIENTS_DB`               | SQLite database path for client registrations                                               | `data/clients.db`               |
+| `AS_CLIENT_STORE`             | Client store driver (`sqlite` or `memory`)                                                  | `sqlite`                        |
+| `AS_ADMIN_ADDR`               | Bind address for the admin client registry API                                              | `127.0.0.1:8082`                |
 | `AS_SIGNING_KEY_BASE64`       | Base64-encoded HMAC signing key                                                              | `ZGV2LXNpZ25pbmcta2V5LTEyMzQ=`  |
 | `AS_SIGNING_KEY_ID`           | JWT header `kid`                                                                             | `dev-hs256`                     |
 | `AS_CODE_TTL_SECONDS`         | Authorisation code lifetime (seconds)                                                        | `120`                           |
@@ -310,4 +335,3 @@ internal/
   store/        # OAuth client/code/refresh stores and identity store implementations
 scripts/        # Automation helpers
 ```
-

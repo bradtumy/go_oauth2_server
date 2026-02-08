@@ -7,35 +7,38 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go_oauth2_server/internal/store"
 )
 
 // Config represents runtime configuration for the authorization server.
 type Config struct {
-	Issuer              string
-	Audience            string
-	SigningKeyPEM       []byte
-	SigningKeyID        string
-	DefaultClientID     string
-	DefaultClientSecret string
-	CodeTTL             time.Duration
-	AccessTokenTTL      time.Duration
-	RefreshTokenTTL     time.Duration
-	OBOTokenTTL         time.Duration
-	AdminToken          string
-	AllowLegacy         bool
-	SeedIdentitiesPath  string
+	Issuer             string
+	Audience           string
+	SigningKeyPEM      []byte
+	SigningKeyID       string
+	CodeTTL            time.Duration
+	AccessTokenTTL     time.Duration
+	RefreshTokenTTL    time.Duration
+	OBOTokenTTL        time.Duration
+	AdminToken         string
+	AllowLegacy        bool
+	SeedIdentitiesPath string
+	ClientDBPath       string
+	ClientStoreDriver  string
+	AdminAddr          string
 }
 
 const (
 	defaultIssuer         = "http://localhost:8080"
 	defaultAudience       = "http://localhost:9090"
-	defaultClientID       = "client-xyz"
-	defaultClientSecret   = "secret-xyz"
 	defaultSigningKeyID   = "dev-rs256"
 	defaultCodeTTLSeconds = 120
 	defaultAccessTTL      = 3600
 	defaultRefreshTTL     = 86400
 	defaultOBOTTL         = 900
+	defaultClientDBPath   = "data/clients.db"
+	defaultAdminAddr      = "127.0.0.1:8082"
 )
 
 const defaultSigningKeyPEM = `-----BEGIN PRIVATE KEY-----
@@ -70,13 +73,14 @@ odOEQaR0ILGMQJZmpfvekDyK
 // Load loads configuration from environment variables.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Issuer:              firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
-		Audience:            firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
-		DefaultClientID:     getEnv("AS_DEFAULT_CLIENT_ID", defaultClientID),
-		DefaultClientSecret: getEnv("AS_DEFAULT_CLIENT_SECRET", defaultClientSecret),
-		SigningKeyID:        getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
-		AdminToken:          getEnv("ADMIN_TOKEN", ""),
-		SeedIdentitiesPath:  getEnv("SEED_IDENTITIES_JSON", ""),
+		Issuer:             firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
+		Audience:           firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
+		SigningKeyID:       getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
+		AdminToken:         firstNonEmpty(getEnv("AS_ADMIN_TOKEN", ""), getEnv("ADMIN_TOKEN", "")),
+		SeedIdentitiesPath: getEnv("SEED_IDENTITIES_JSON", ""),
+		ClientDBPath:       getEnv("AS_CLIENTS_DB", defaultClientDBPath),
+		ClientStoreDriver:  firstNonEmpty(getEnv("AS_CLIENT_STORE", ""), store.DefaultClientStoreDriver()),
+		AdminAddr:          getEnv("AS_ADMIN_ADDR", defaultAdminAddr),
 	}
 
 	signingKey, err := loadSigningKeyPEM()
