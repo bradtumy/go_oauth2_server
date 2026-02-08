@@ -38,7 +38,11 @@ odOEQaR0ILGMQJZmpfvekDyK
 -----END PRIVATE KEY-----`
 
 func TestResolveAgentIgnoresSubjectAssertionClientID(t *testing.T) {
-	signer, err := internaljwt.NewSigner("issuer", "aud", []byte(testSigningKeyPEM), "", time.Minute, time.Minute, time.Minute)
+	keySet, err := internaljwt.LoadKeySetFromPEM([]byte(testSigningKeyPEM), "test-key")
+	if err != nil {
+		t.Fatalf("init signer: %v", err)
+	}
+	signer, err := internaljwt.NewSignerWithKeySet("issuer", "aud", keySet, time.Minute, time.Minute, time.Minute)
 	if err != nil {
 		t.Fatalf("init signer: %v", err)
 	}

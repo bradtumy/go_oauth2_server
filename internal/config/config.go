@@ -13,32 +13,50 @@ import (
 
 // Config represents runtime configuration for the authorization server.
 type Config struct {
-	Issuer             string
-	Audience           string
-	SigningKeyPEM      []byte
-	SigningKeyID       string
-	CodeTTL            time.Duration
-	AccessTokenTTL     time.Duration
-	RefreshTokenTTL    time.Duration
-	OBOTokenTTL        time.Duration
-	AdminToken         string
-	AllowLegacy        bool
-	SeedIdentitiesPath string
-	ClientDBPath       string
-	ClientStoreDriver  string
-	AdminAddr          string
+	Issuer                     string
+	Audience                   string
+	SigningKeyPEM              []byte
+	SigningKeyID               string
+	SigningKeyDir              string
+	SigningKeyRotationInterval time.Duration
+	CodeTTL                    time.Duration
+	AccessTokenTTL             time.Duration
+	RefreshTokenTTL            time.Duration
+	OBOTokenTTL                time.Duration
+	AdminToken                 string
+	AllowLegacy                bool
+	SeedIdentitiesPath         string
+	ClientDBPath               string
+	ClientStoreDriver          string
+	AdminAddr                  string
+	AuthorizeRateLimitRPS      int
+	AuthorizeRateLimitBurst    int
+	TokenRateLimitRPS          int
+	TokenRateLimitBurst        int
+	IntrospectRateLimitRPS     int
+	IntrospectRateLimitBurst   int
+	AdminRateLimitRPS          int
+	AdminRateLimitBurst        int
 }
 
 const (
-	defaultIssuer         = "http://localhost:8080"
-	defaultAudience       = "http://localhost:9090"
-	defaultSigningKeyID   = "dev-rs256"
-	defaultCodeTTLSeconds = 120
-	defaultAccessTTL      = 3600
-	defaultRefreshTTL     = 86400
-	defaultOBOTTL         = 900
-	defaultClientDBPath   = "data/clients.db"
-	defaultAdminAddr      = "127.0.0.1:8082"
+	defaultIssuer          = "http://localhost:8080"
+	defaultAudience        = "http://localhost:9090"
+	defaultSigningKeyID    = "dev-rs256"
+	defaultCodeTTLSeconds  = 120
+	defaultAccessTTL       = 3600
+	defaultRefreshTTL      = 86400
+	defaultOBOTTL          = 900
+	defaultClientDBPath    = "data/clients.db"
+	defaultAdminAddr       = "127.0.0.1:8082"
+	defaultAuthorizeRPS    = 5
+	defaultAuthorizeBurst  = 10
+	defaultTokenRPS        = 10
+	defaultTokenBurst      = 20
+	defaultIntrospectRPS   = 10
+	defaultIntrospectBurst = 20
+	defaultAdminRPS        = 5
+	defaultAdminBurst      = 10
 )
 
 const defaultSigningKeyPEM = `-----BEGIN PRIVATE KEY-----
@@ -76,6 +94,7 @@ func Load() (*Config, error) {
 		Issuer:             firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
 		Audience:           firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
 		SigningKeyID:       getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
+		SigningKeyDir:      getEnv("AS_SIGNING_KEYS_DIR", ""),
 		AdminToken:         firstNonEmpty(getEnv("AS_ADMIN_TOKEN", ""), getEnv("ADMIN_TOKEN", "")),
 		SeedIdentitiesPath: getEnv("SEED_IDENTITIES_JSON", ""),
 		ClientDBPath:       getEnv("AS_CLIENTS_DB", defaultClientDBPath),
@@ -83,11 +102,19 @@ func Load() (*Config, error) {
 		AdminAddr:          getEnv("AS_ADMIN_ADDR", defaultAdminAddr),
 	}
 
-	signingKey, err := loadSigningKeyPEM()
+	if cfg.SigningKeyDir == "" {
+		signingKey, err := loadSigningKeyPEM()
+		if err != nil {
+			return nil, err
+		}
+		cfg.SigningKeyPEM = signingKey
+	}
+
+	rotationSeconds, err := parseDurationSecondsAllowZero("AS_SIGNING_KEY_ROTATION_SECONDS", 0)
 	if err != nil {
 		return nil, err
 	}
-	cfg.SigningKeyPEM = signingKey
+	cfg.SigningKeyRotationInterval = rotationSeconds
 
 	codeTTL, err := parseDurationSeconds("AS_CODE_TTL_SECONDS", defaultCodeTTLSeconds)
 	if err != nil {
@@ -118,6 +145,47 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.AllowLegacy = allowLegacy
+
+	authorizeRPS, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_RPS", defaultAuthorizeRPS)
+	if err != nil {
+		return nil, err
+	}
+	authorizeBurst, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_BURST", defaultAuthorizeBurst)
+	if err != nil {
+		return nil, err
+	}
+	tokenRPS, err := parseIntAllowZero("AS_RATE_LIMIT_TOKEN_RPS", defaultTokenRPS)
+	if err != nil {
+		return nil, err
+	}
+	tokenBurst, err := parseIntAllowZero("AS_RATE_LIMIT_TOKEN_BURST", defaultTokenBurst)
+	if err != nil {
+		return nil, err
+	}
+	introspectRPS, err := parseIntAllowZero("AS_RATE_LIMIT_INTROSPECT_RPS", defaultIntrospectRPS)
+	if err != nil {
+		return nil, err
+	}
+	introspectBurst, err := parseIntAllowZero("AS_RATE_LIMIT_INTROSPECT_BURST", defaultIntrospectBurst)
+	if err != nil {
+		return nil, err
+	}
+	adminRPS, err := parseIntAllowZero("AS_RATE_LIMIT_ADMIN_RPS", defaultAdminRPS)
+	if err != nil {
+		return nil, err
+	}
+	adminBurst, err := parseIntAllowZero("AS_RATE_LIMIT_ADMIN_BURST", defaultAdminBurst)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AuthorizeRateLimitRPS = authorizeRPS
+	cfg.AuthorizeRateLimitBurst = authorizeBurst
+	cfg.TokenRateLimitRPS = tokenRPS
+	cfg.TokenRateLimitBurst = tokenBurst
+	cfg.IntrospectRateLimitRPS = introspectRPS
+	cfg.IntrospectRateLimitBurst = introspectBurst
+	cfg.AdminRateLimitRPS = adminRPS
+	cfg.AdminRateLimitBurst = adminBurst
 
 	return cfg, nil
 }
@@ -154,6 +222,21 @@ func parseDurationSeconds(env string, fallback int) (time.Duration, error) {
 	return time.Duration(val) * time.Second, nil
 }
 
+func parseDurationSecondsAllowZero(env string, fallback int) (time.Duration, error) {
+	raw := getEnv(env, "")
+	if raw == "" {
+		return time.Duration(fallback) * time.Second, nil
+	}
+	val, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", env, err)
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", env)
+	}
+	return time.Duration(val) * time.Second, nil
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -174,6 +257,21 @@ func parseBool(env string, fallback bool) (bool, error) {
 	default:
 		return false, fmt.Errorf("invalid %s: %s", env, raw)
 	}
+}
+
+func parseIntAllowZero(env string, fallback int) (int, error) {
+	raw := getEnv(env, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	val, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", env, err)
+	}
+	if val < 0 {
+		return 0, fmt.Errorf("%s must be non-negative", env)
+	}
+	return val, nil
 }
 
 func firstNonEmpty(values ...string) string {

@@ -20,7 +20,16 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.KeyID, cfg.AccessTTL, cfg.RefreshTTL, cfg.AccessTTL)
+	var keySet *internaljwt.KeySet
+	if cfg.SigningKeyDir != "" {
+		keySet, err = internaljwt.LoadKeySetFromDir(cfg.SigningKeyDir, cfg.KeyID)
+	} else {
+		keySet, err = internaljwt.LoadKeySetFromPEM(cfg.SigningKeyPEM, cfg.KeyID)
+	}
+	if err != nil {
+		log.Fatalf("init signer: %v", err)
+	}
+	signer, err := internaljwt.NewSignerWithKeySet(cfg.Issuer, cfg.Audience, keySet, cfg.AccessTTL, cfg.RefreshTTL, cfg.AccessTTL)
 	if err != nil {
 		log.Fatalf("init signer: %v", err)
 	}
@@ -75,6 +84,7 @@ type resourceConfig struct {
 	Issuer        string
 	Audience      string
 	SigningKeyPEM []byte
+	SigningKeyDir string
 	KeyID         string
 	AccessTTL     time.Duration
 	RefreshTTL    time.Duration
@@ -94,6 +104,7 @@ func loadConfig() (*resourceConfig, error) {
 		Issuer:        issuer,
 		Audience:      audience,
 		SigningKeyPEM: key.SigningKeyPEM,
+		SigningKeyDir: key.SigningKeyDir,
 		KeyID:         getEnv("AS_SIGNING_KEY_ID", "dev-rs256"),
 		AccessTTL:     15 * time.Minute,
 		RefreshTTL:    24 * time.Hour,

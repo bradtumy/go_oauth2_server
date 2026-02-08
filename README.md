@@ -7,11 +7,12 @@ An educational OAuth 2.0 authorisation server and companion resource server writ
 - Rich authorisation requests (`authorization_details`) with permission hashing.
 - Identity registration APIs for both humans and agents that drive every OAuth/OBO flow.
 
-The project is intended for local development and demo scenarios. Tokens are JSON Web Tokens (JWTs) signed with a symmetric key; the resource server verifies them using the shared key and a published JWKS endpoint.
+The project is intended for local development and demo scenarios. Tokens are JSON Web Tokens (JWTs) signed with RSA keys; the resource server verifies them using the same key material and a published JWKS endpoint.
 
 ## Contents
 
 - [Architecture](#architecture)
+- [Production Readiness](#production-readiness)
 - [Prerequisites](#prerequisites)
 - [Running locally](#running-locally)
 - [Running with Docker Compose](#running-with-docker-compose)
@@ -47,6 +48,23 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 - **Authorization Server** – owns human and agent registrations, issues authorisation codes, access tokens, refresh tokens, subject assertions, and OBO tokens. All flows resolve identities from the in-memory identity store.
 - **Resource Server** – a tiny API that expects an OBO access token. It verifies the signature, audience, issuer, human subject, actor information, `perm` claim, and `authorization_details` payload.
 
+## Production Readiness
+
+This project started as a lab. The following hardening has been added to help move toward production readiness without a major refactor:
+
+- **Authorization code hardening:** exact redirect URI matching, PKCE (S256) required for public clients, and one-time authorization code use with TTLs.
+- **Refresh token safety:** refresh token rotation with reuse detection (reuse revokes the entire family).
+- **Key management:** RSA keys with `kid` and JWKS publication; optional multi-key JWKS for overlap during rotation.
+- **Rate limiting:** configurable token bucket limits for `/oauth2/authorize`, `/oauth2/token`, `/oauth2/introspect`, and `/admin/*`.
+- **Introspection and revocation:** `/oauth2/introspect` and `/oauth2/revoke` supported for refresh tokens (access token revocation is not supported in-memory).
+
+**Still not production complete:**
+
+- No OIDC discovery or ID token support.
+- Access token revocation is not persisted or enforced (JWTs are self-contained).
+- HA/statelessness requires moving codes/refresh tokens to shared storage.
+- Metrics and structured audit logs are minimal; see `docs/PROD_READINESS_PLAN.md`.
+
 ## Prerequisites
 
 - Go **1.24+**
@@ -68,7 +86,6 @@ go run ./cmd/as
 
 # In another terminal start the resource server (RS)
 RS_AUDIENCE=http://localhost:9090 \
-AS_JWKS_URL=http://localhost:8080/.well-known/jwks.json \
 go run ./cmd/rs
 ```
 
@@ -166,8 +183,12 @@ High-level steps:
 3. Exchange the code at `/oauth2/token` for access/refresh tokens.
 
 ```bash
+# Generate a PKCE verifier/challenge for public clients
+CODE_VERIFIER=$(openssl rand -base64 32 | tr -d '=+/')
+CODE_CHALLENGE=$(printf '%s' "${CODE_VERIFIER}" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
 # Launch the authorisation request (use either human_id or email)
-open "http://localhost:8080/oauth2/authorize?response_type=code&client_id=human-web&redirect_uri=http://localhost:5555/callback&scope=tickets.read&email=alice@example.com"
+open "http://localhost:8080/oauth2/authorize?response_type=code&client_id=human-web&redirect_uri=http://localhost:5555/callback&scope=tickets.read&email=alice@example.com&code_challenge=${CODE_CHALLENGE}&code_challenge_method=S256"
 
 # Exchange the code for tokens
 curl -sS -X POST http://localhost:8080/oauth2/token \
@@ -175,6 +196,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'grant_type=authorization_code' \
   -d 'code=<CODE_FROM_REDIRECT>' \
   -d 'client_id=human-web' \
+  -d "code_verifier=${CODE_VERIFIER}" \
   -d 'redirect_uri=http://localhost:5555/callback' | jq .
 ```
 
@@ -345,23 +367,34 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 
 ## Configuration
 
-| Environment variable          | Description                                                                                  | Default                         |
-| ----------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------- |
-| `ISSUER`                      | Issuer used in all minted tokens                                                             | `http://localhost:8080`         |
-| `RS_AUDIENCE`                 | Audience for access and OBO tokens                                                           | `http://localhost:9090`         |
-| `AS_ADMIN_TOKEN`              | Shared secret that gates `/register/*` (`X-Admin-Token`) and `/admin/*` (`Authorization: Bearer`) endpoints | unset          |
-| `ADMIN_TOKEN`                 | Legacy alias for `AS_ADMIN_TOKEN`                                                          | unset                           |
-| `ALLOW_LEGACY_HARDCODED`      | Set to `true` to allow legacy hard-coded users/agents (development only)                    | `false`                         |
-| `SEED_IDENTITIES_JSON`        | Path to a JSON file containing initial humans/agents (`{"humans":[],"agents":[]}`)       | unset                           |
-| `AS_CLIENTS_DB`               | SQLite database path for client registrations                                               | `data/clients.db`               |
-| `AS_CLIENT_STORE`             | Client store driver (`sqlite` or `memory`)                                                  | `sqlite`                        |
-| `AS_ADMIN_ADDR`               | Bind address for the admin client registry API                                              | `127.0.0.1:8082`                |
-| `AS_SIGNING_KEY_BASE64`       | Base64-encoded HMAC signing key                                                              | `ZGV2LXNpZ25pbmcta2V5LTEyMzQ=`  |
-| `AS_SIGNING_KEY_ID`           | JWT header `kid`                                                                             | `dev-hs256`                     |
-| `AS_CODE_TTL_SECONDS`         | Authorisation code lifetime (seconds)                                                        | `120`                           |
-| `AS_ACCESS_TOKEN_TTL_SECONDS` | Access token lifetime (seconds)                                                              | `3600`                          |
-| `AS_REFRESH_TOKEN_TTL_SECONDS`| Refresh token lifetime (seconds)                                                             | `86400`                         |
-| `AS_OBO_TOKEN_TTL_SECONDS`    | OBO token lifetime (seconds)                                                                 | `900`                           |
+| Environment variable               | Description                                                                                  | Default                         |
+| ---------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------- |
+| `ISSUER`                           | Issuer used in all minted tokens                                                             | `http://localhost:8080`         |
+| `RS_AUDIENCE`                      | Audience for access and OBO tokens                                                           | `http://localhost:9090`         |
+| `AS_ADMIN_TOKEN`                   | Shared secret that gates `/register/*` (`X-Admin-Token`) and `/admin/*` (`Authorization: Bearer`) endpoints | unset          |
+| `ADMIN_TOKEN`                      | Legacy alias for `AS_ADMIN_TOKEN`                                                            | unset                           |
+| `ALLOW_LEGACY_HARDCODED`           | Set to `true` to allow legacy hard-coded users/agents (development only)                    | `false`                         |
+| `SEED_IDENTITIES_JSON`             | Path to a JSON file containing initial humans/agents (`{"humans":[],"agents":[]}`)           | unset                           |
+| `AS_CLIENTS_DB`                    | SQLite database path for client registrations                                               | `data/clients.db`               |
+| `AS_CLIENT_STORE`                  | Client store driver (`sqlite` or `memory`)                                                  | `sqlite`                        |
+| `AS_ADMIN_ADDR`                    | Bind address for the admin client registry API                                              | `127.0.0.1:8082`                |
+| `AS_SIGNING_KEY_PEM`               | RSA private key PEM (single key fallback)                                                   | embedded dev key                |
+| `AS_SIGNING_KEY_PATH`              | Path to RSA private key PEM                                                                  | unset                           |
+| `AS_SIGNING_KEYS_DIR`              | Directory of RSA private keys (filename base = `kid`)                                        | unset                           |
+| `AS_SIGNING_KEY_ID`                | Active JWT header `kid` (when using `AS_SIGNING_KEYS_DIR`)                                   | `dev-rs256`                     |
+| `AS_SIGNING_KEY_ROTATION_SECONDS`  | Interval to reload keys from `AS_SIGNING_KEYS_DIR` (0 disables)                              | `0`                             |
+| `AS_CODE_TTL_SECONDS`              | Authorisation code lifetime (seconds)                                                       | `120`                           |
+| `AS_ACCESS_TOKEN_TTL_SECONDS`      | Access token lifetime (seconds)                                                             | `3600`                          |
+| `AS_REFRESH_TOKEN_TTL_SECONDS`     | Refresh token lifetime (seconds)                                                            | `86400`                         |
+| `AS_OBO_TOKEN_TTL_SECONDS`         | OBO token lifetime (seconds)                                                                | `900`                           |
+| `AS_RATE_LIMIT_AUTHORIZE_RPS`      | Rate limit (requests/sec) for `/oauth2/authorize`                                           | `5`                             |
+| `AS_RATE_LIMIT_AUTHORIZE_BURST`    | Burst limit for `/oauth2/authorize`                                                         | `10`                            |
+| `AS_RATE_LIMIT_TOKEN_RPS`          | Rate limit (requests/sec) for `/oauth2/token`                                               | `10`                            |
+| `AS_RATE_LIMIT_TOKEN_BURST`        | Burst limit for `/oauth2/token`                                                             | `20`                            |
+| `AS_RATE_LIMIT_INTROSPECT_RPS`     | Rate limit (requests/sec) for `/oauth2/introspect`                                          | `10`                            |
+| `AS_RATE_LIMIT_INTROSPECT_BURST`   | Burst limit for `/oauth2/introspect`                                                        | `20`                            |
+| `AS_RATE_LIMIT_ADMIN_RPS`          | Rate limit (requests/sec) for `/admin/*`                                                    | `5`                             |
+| `AS_RATE_LIMIT_ADMIN_BURST`        | Burst limit for `/admin/*`                                                                  | `10`                            |
 
 All configuration is logged at server startup (secrets are masked in logs).
 
