@@ -1,29 +1,29 @@
 package config
 
 import (
-        "encoding/base64"
-        "fmt"
-        "os"
-        "strconv"
-        "strings"
-        "time"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // Config represents runtime configuration for the authorization server.
 type Config struct {
-        Issuer              string
-        Audience            string
-        SigningKey          []byte
-        SigningKeyID        string
-        DefaultClientID     string
-        DefaultClientSecret string
-        CodeTTL             time.Duration
-        AccessTokenTTL      time.Duration
-        RefreshTokenTTL     time.Duration
-        OBOTokenTTL         time.Duration
-        AdminToken          string
-        AllowLegacy         bool
-        SeedIdentitiesPath  string
+	Issuer              string
+	Audience            string
+	SigningKeyPEM       []byte
+	SigningKeyID        string
+	DefaultClientID     string
+	DefaultClientSecret string
+	CodeTTL             time.Duration
+	AccessTokenTTL      time.Duration
+	RefreshTokenTTL     time.Duration
+	OBOTokenTTL         time.Duration
+	AdminToken          string
+	AllowLegacy         bool
+	SeedIdentitiesPath  string
 }
 
 const (
@@ -31,32 +31,59 @@ const (
 	defaultAudience       = "http://localhost:9090"
 	defaultClientID       = "client-xyz"
 	defaultClientSecret   = "secret-xyz"
-	defaultSigningKeyB64  = "ZGV2LXNpZ25pbmcta2V5LTEyMzQ=" // base64("dev-signing-key-1234")
-	defaultSigningKeyID   = "dev-hs256"
+	defaultSigningKeyID   = "dev-rs256"
 	defaultCodeTTLSeconds = 120
 	defaultAccessTTL      = 3600
 	defaultRefreshTTL     = 86400
 	defaultOBOTTL         = 900
 )
 
+const defaultSigningKeyPEM = `-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCk3F5CWCLo296k
+DRBCPt2wuhc9wbAdotnCt6prj+Ue4vQGFXzqybvqEr+M7g8YFOOIGA0jdoWMg7to
+ztgLyLqjrq9LWVWI4ZeMalweI8wAQcT49EDrC7d/QITMeie/bQiXDMZOshE6eKkv
+N1qjax1tgxiQW2vJNIGuZz3g0ytCjK+2HXxovkkzOm59FEzQ87gYwGQR75AAqnmt
+Fa8eFXPGpa7eMSa+yJeQFjX4nQ1e16wnhueibheoJggrSSM+fkO9u5AWg+Synrld
+ETb4iMP9ftQW9knkiaABFSGkZ/paMuWhzxaRSym+Z1Cf5amUpqKx0Bi/Ut5lVRJV
+RpJA+6qFAgMBAAECggEAP0QKMC+ehfoKgK46tRFnBfEEBkEUEutx4dWV4t0/shCq
+UMNiQr/UC0nSlISu6jDp+EoykI9lRL0w6FGoey024qWgw6uutW7NN6eBXleia97R
+djBV0V2Xt4/M5qNiKYXwK/dNCtou3l97nZECiYALtQEAJjXPMVGjCoi4KFUhXtH7
+yQHfCkoyRyPnIU3aYwzqXdaejyp2uCmLzprpPcg0NoFLh8lASSWUybPws3nEk7Bq
+qGfGL9eGSm28gNCMu8O8CDWApOPfAyNi6CWbDBY5xf1uow/q2xX5V5bTPZwC3HsO
+HtIiu6+JWcdlYifLUorYwuCeWAt2B7Nn0tsbpH5KKQKBgQDmnjZAms9XsfJ2/t43
+L0LQTvx1H9iQUD0sghs1oWDifuAk+KrvfrzX6Cbvqw4dF/CWIl0segSkDHVZwQjP
+FVMekQ4fnXTG6OsQeyjrjB2NWhM2oizY7FxzobEu/rhE+DpmlsFLlg80b6ZI+suJ
+avAVo82W1rSxedYLd8dEAZIqEwKBgQC3AWlMqLob5ZUZlINyjlZ7VY1+EEUmtXPg
+mRD97aLQxO/NG3G8LtMSs/VwXkRy25YZVIN2ZJe5QLsiwSspQ3yJuPfb5bQjWw2E
+0CZvW7ZgRJoBFR6jxb3aLAvUoqPqokL6wlVA5VjGP0t4xzCBFVATn3kUWzbWlz2k
+aXfpImHsBwKBgQCf0kEy4JaU5cNs6BBEGkKpbjPTT7Cbwp/CeqA0uJQWI2te894y
+f5iL4F0rd1Yen3qh8Uq1ChKxRdkFzJs4OEUUR96L1mkZeE1/bHrdUosgbK4oDJgb
+9SHVGNdcBDbbxVNjyVJH+cSryDxrEzN/FlcwCAbwY/dxj0fhRq8X2CbddQKBgCXC
++cpiqnxlJB3yIil6K2gpoBeaHdq96Fo422O6LDVt3ZlyB0bwVoducL+uA+u7Wb6C
+TNoaKaCFNdgXCePq1ADLFQHf5QrCmAiGtteVkg1NOoXsqLTcca9aFVrb8HzS3IVH
+ojXQ3T+TAey7FUwdbLeP2XkU1Tz0WjjZtm95s8DzAoGBAKMKN05H4h2s74TC3EJB
+ud70LksnQheSBameXDdKe0t9ocCqYlR3L4ECIE3/qPEeHR+esphI9s4WgivGVZEL
+s8Db464pzs9t0Z/+RowMN8nMuwXoybwSJYCdm83GEevJoZ4av5gaJCvIEjGHNCul
+odOEQaR0ILGMQJZmpfvekDyK
+-----END PRIVATE KEY-----`
+
 // Load loads configuration from environment variables.
 func Load() (*Config, error) {
-        cfg := &Config{
-                Issuer:              firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
-                Audience:            firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
-                DefaultClientID:     getEnv("AS_DEFAULT_CLIENT_ID", defaultClientID),
-                DefaultClientSecret: getEnv("AS_DEFAULT_CLIENT_SECRET", defaultClientSecret),
-                SigningKeyID:        getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
-                AdminToken:          getEnv("ADMIN_TOKEN", ""),
-                SeedIdentitiesPath:  getEnv("SEED_IDENTITIES_JSON", ""),
-        }
-
-	signingKeyRaw := getEnv("AS_SIGNING_KEY_BASE64", defaultSigningKeyB64)
-	key, err := base64.StdEncoding.DecodeString(signingKeyRaw)
-	if err != nil {
-		return nil, fmt.Errorf("decode signing key: %w", err)
+	cfg := &Config{
+		Issuer:              firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
+		Audience:            firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
+		DefaultClientID:     getEnv("AS_DEFAULT_CLIENT_ID", defaultClientID),
+		DefaultClientSecret: getEnv("AS_DEFAULT_CLIENT_SECRET", defaultClientSecret),
+		SigningKeyID:        getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
+		AdminToken:          getEnv("ADMIN_TOKEN", ""),
+		SeedIdentitiesPath:  getEnv("SEED_IDENTITIES_JSON", ""),
 	}
-	cfg.SigningKey = key
+
+	signingKey, err := loadSigningKeyPEM()
+	if err != nil {
+		return nil, err
+	}
+	cfg.SigningKeyPEM = signingKey
 
 	codeTTL, err := parseDurationSeconds("AS_CODE_TTL_SECONDS", defaultCodeTTLSeconds)
 	if err != nil {
@@ -80,15 +107,32 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-        cfg.OBOTokenTTL = oboTTL
+	cfg.OBOTokenTTL = oboTTL
 
-        allowLegacy, err := parseBool("ALLOW_LEGACY_HARDCODED", false)
-        if err != nil {
-                return nil, err
-        }
-        cfg.AllowLegacy = allowLegacy
+	allowLegacy, err := parseBool("ALLOW_LEGACY_HARDCODED", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AllowLegacy = allowLegacy
 
-        return cfg, nil
+	return cfg, nil
+}
+
+func loadSigningKeyPEM() ([]byte, error) {
+	if key := strings.TrimSpace(getEnv("AS_SIGNING_KEY_PEM", "")); key != "" {
+		return []byte(key), nil
+	}
+	if path := strings.TrimSpace(getEnv("AS_SIGNING_KEY_PATH", "")); path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read signing key: %w", err)
+		}
+		return data, nil
+	}
+	if strings.TrimSpace(defaultSigningKeyPEM) == "" {
+		return nil, errors.New("missing signing key")
+	}
+	return []byte(defaultSigningKeyPEM), nil
 }
 
 func parseDurationSeconds(env string, fallback int) (time.Duration, error) {
@@ -107,32 +151,32 @@ func parseDurationSeconds(env string, fallback int) (time.Duration, error) {
 }
 
 func getEnv(key, fallback string) string {
-        if v := os.Getenv(key); v != "" {
-                return v
-        }
-        return fallback
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
 }
 
 func parseBool(env string, fallback bool) (bool, error) {
-        raw := getEnv(env, "")
-        if raw == "" {
-                return fallback, nil
-        }
-        switch strings.ToLower(strings.TrimSpace(raw)) {
-        case "1", "true", "yes", "y":
-                return true, nil
-        case "0", "false", "no", "n":
-                return false, nil
-        default:
-                return false, fmt.Errorf("invalid %s: %s", env, raw)
-        }
+	raw := getEnv(env, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y":
+		return true, nil
+	case "0", "false", "no", "n":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid %s: %s", env, raw)
+	}
 }
 
 func firstNonEmpty(values ...string) string {
-        for _, v := range values {
-                if strings.TrimSpace(v) != "" {
-                        return v
-                }
-        }
-        return ""
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

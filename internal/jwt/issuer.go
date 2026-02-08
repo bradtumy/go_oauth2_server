@@ -2,12 +2,18 @@ package jwt
 
 import (
 	"context"
+	"crypto"
 	"crypto/hmac"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"math/big"
 	"time"
 
 	"go_oauth2_server/internal/random"
@@ -20,7 +26,8 @@ type MapClaims map[string]any
 type Signer struct {
 	issuer     string
 	audience   string
-	key        []byte
+	privateKey *rsa.PrivateKey
+	publicKey  *rsa.PublicKey
 	keyID      string
 	accessTTL  time.Duration
 	refreshTTL time.Duration
@@ -39,26 +46,31 @@ var (
 )
 
 // NewSigner constructs a new Signer instance.
-func NewSigner(issuer, audience string, key []byte, keyID string, accessTTL, refreshTTL, oboTTL time.Duration) *Signer {
+func NewSigner(issuer, audience string, keyPEM []byte, keyID string, accessTTL, refreshTTL, oboTTL time.Duration) (*Signer, error) {
+	privateKey, err := parseRSAPrivateKey(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse signing key: %w", err)
+	}
 	return &Signer{
 		issuer:     issuer,
 		audience:   audience,
-		key:        key,
+		privateKey: privateKey,
+		publicKey:  &privateKey.PublicKey,
 		keyID:      keyID,
 		accessTTL:  accessTTL,
 		refreshTTL: refreshTTL,
 		oboTTL:     oboTTL,
-	}
+	}, nil
 }
 
 // IssueAccess issues a standard access token for a subject and client.
 func (s *Signer) IssueAccess(ctx context.Context, subject, clientID, scope string) (token string, expiresIn int, err error) {
-        return s.IssueAccessWithClaims(ctx, subject, clientID, scope, nil)
+	return s.IssueAccessWithClaims(ctx, subject, clientID, scope, nil)
 }
 
 // IssueAccessWithClaims issues an access token with additional private claims.
 func (s *Signer) IssueAccessWithClaims(ctx context.Context, subject, clientID, scope string, extra map[string]any) (string, int, error) {
-        return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra)
+	return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra)
 }
 
 // IssueOBOToken issues an OBO access token with given claims payload.
@@ -79,18 +91,18 @@ func (s *Signer) IssueOBOToken(ctx context.Context, subject, clientID string, pe
 	if actor != nil {
 		extraMap["act"] = actor
 	}
-        return s.issue(ctx, subject, clientID, "", perms, authz, ttl, audience, extraMap)
+	return s.issue(ctx, subject, clientID, "", perms, authz, ttl, audience, extraMap)
 }
 
 // IssueSubjectAssertion issues a subject assertion JWT for token exchange bootstrap.
 func (s *Signer) IssueSubjectAssertion(ctx context.Context, subject string, ttl time.Duration) (string, int, error) {
-        if ttl <= 0 {
-                ttl = 5 * time.Minute
-        }
-        extra := map[string]any{
-                "token_use": "subject_assertion",
-        }
-        return s.issue(ctx, subject, subject, "", nil, nil, ttl, s.issuer, extra)
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	extra := map[string]any{
+		"token_use": "subject_assertion",
+	}
+	return s.issue(ctx, subject, subject, "", nil, nil, ttl, s.issuer, extra)
 }
 
 func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, perms []string, authz any, ttl time.Duration, audience string, extra map[string]any) (token string, expiresIn int, err error) {
@@ -123,7 +135,7 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 	}
 
 	header := map[string]any{
-		"alg": "HS256",
+		"alg": "RS256",
 		"typ": "JWT",
 	}
 	if s.keyID != "" {
@@ -138,10 +150,12 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 		return "", 0, fmt.Errorf("marshal claims: %w", err)
 	}
 	tokenUnsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
-	mac := hmac.New(sha256.New, s.key)
-	mac.Write([]byte(tokenUnsigned))
-	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
-	return tokenUnsigned + "." + sig, int(ttl.Seconds()), nil
+	hash := sha256.Sum256([]byte(tokenUnsigned))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, s.privateKey, crypto.SHA256, hash[:])
+	if err != nil {
+		return "", 0, fmt.Errorf("sign token: %w", err)
+	}
+	return tokenUnsigned + "." + base64.RawURLEncoding.EncodeToString(sig), int(ttl.Seconds()), nil
 }
 
 // Verify validates a JWT and returns map claims.
@@ -159,9 +173,8 @@ func (s *Signer) Verify(token, expectedAudience string) (MapClaims, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode signature: %w", err)
 	}
-	mac := hmac.New(sha256.New, s.key)
-	mac.Write([]byte(unsigned))
-	if !hmac.Equal(sigBytes, mac.Sum(nil)) {
+	hash := sha256.Sum256([]byte(unsigned))
+	if err := rsa.VerifyPKCS1v15(s.publicKey, crypto.SHA256, hash[:], sigBytes); err != nil {
 		return nil, errors.New("signature mismatch")
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -235,16 +248,18 @@ func asInt(v any) (int64, bool) {
 	return 0, false
 }
 
-// JWKS returns a simple JWK set exposing the symmetric key for development.
+// JWKS returns a JWK set exposing the RSA public key.
 func (s *Signer) JWKS() (map[string]any, error) {
-	if len(s.key) == 0 {
+	if s.publicKey == nil {
 		return nil, errors.New("missing signing key")
 	}
-	k := base64.RawURLEncoding.EncodeToString(s.key)
+	n := base64.RawURLEncoding.EncodeToString(s.publicKey.N.Bytes())
+	e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(s.publicKey.E)).Bytes())
 	jwk := map[string]any{
-		"kty": "oct",
-		"alg": "HS256",
-		"k":   k,
+		"kty": "RSA",
+		"alg": "RS256",
+		"n":   n,
+		"e":   e,
 		"kid": s.keyID,
 		"use": "sig",
 	}
@@ -267,6 +282,25 @@ func (s *Signer) Audience() string {
 // Issuer exposes the configured issuer.
 func (s *Signer) Issuer() string {
 	return s.issuer
+}
+
+func parseRSAPrivateKey(keyPEM []byte) (*rsa.PrivateKey, error) {
+	block, _ := pem.Decode(keyPEM)
+	if block == nil {
+		return nil, errors.New("invalid PEM")
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+		return key, nil
+	}
+	parsed, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+	key, ok := parsed.(*rsa.PrivateKey)
+	if !ok {
+		return nil, errors.New("not RSA private key")
+	}
+	return key, nil
 }
 
 func stringsSplit(s string, sep rune) []string {

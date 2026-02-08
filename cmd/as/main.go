@@ -49,7 +49,10 @@ func main() {
 		}
 	}
 
-	signer := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKey, cfg.SigningKeyID, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.SigningKeyID, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	if err != nil {
+		log.Fatalf("init signer: %v", err)
+	}
 	oboService := &obo.Service{Signer: signer, Issuer: cfg.Issuer, Audience: cfg.Audience, OBOTTL: cfg.OBOTokenTTL}
 
 	srv := &authorizationServer{
@@ -256,11 +259,15 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		return
 	}
 	redirectURI := q.Get("redirect_uri")
+	if client.RedirectURI == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri required")
+		return
+	}
 	if redirectURI == "" {
 		redirectURI = client.RedirectURI
 	}
-	if redirectURI == "" {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri required")
+	if redirectURI != client.RedirectURI {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri mismatch")
 		return
 	}
 	human, err := s.resolveHumanSelection(r.Context(), q.Get("human_id"), q.Get("email"))
@@ -538,7 +545,7 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		}
 	}
 
-	subject, _, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
+	subject, subjectClaims, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
 	if err != nil {
 		code := "invalid_request"
 		if errors.Is(err, obo.ErrInvalidToken) {
@@ -546,6 +553,13 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		}
 		writeOAuthError(w, http.StatusBadRequest, code, err.Error())
 		return
+	}
+	requestedScope := strings.TrimSpace(r.PostFormValue("scope"))
+	if requestedScope != "" {
+		if !scopeSubset(requestedScope, subjectClaims["scope"]) {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope exceeds subject token scope")
+			return
+		}
 	}
 	human, err := s.lookupHumanByID(r.Context(), subject)
 	if err != nil {
@@ -737,6 +751,39 @@ func maskSecret(secret string) string {
 		return "****"
 	}
 	return secret[:2] + strings.Repeat("*", len(secret)-4) + secret[len(secret)-2:]
+}
+
+func scopeSubset(requested string, subjectScope any) bool {
+	req := strings.Fields(strings.TrimSpace(requested))
+	if len(req) == 0 {
+		return true
+	}
+	var subject []string
+	switch v := subjectScope.(type) {
+	case string:
+		subject = strings.Fields(strings.TrimSpace(v))
+	case []string:
+		subject = v
+	case []any:
+		for _, entry := range v {
+			if s, ok := entry.(string); ok {
+				subject = append(subject, s)
+			}
+		}
+	}
+	if len(subject) == 0 {
+		return false
+	}
+	allowed := map[string]struct{}{}
+	for _, s := range subject {
+		allowed[s] = struct{}{}
+	}
+	for _, s := range req {
+		if _, ok := allowed[s]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func seedIdentities(ctx context.Context, store identity.Store, path string) error {
