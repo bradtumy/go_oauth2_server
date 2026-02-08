@@ -22,6 +22,7 @@ import (
 	"go_oauth2_server/internal/identity"
 	internaljwt "go_oauth2_server/internal/jwt"
 	"go_oauth2_server/internal/obo"
+	"go_oauth2_server/internal/ratelimit"
 	"go_oauth2_server/internal/store"
 	memstore "go_oauth2_server/internal/store/mem"
 )
@@ -127,6 +128,347 @@ func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 	}
 	if claims["email"] != human.Email {
 		t.Fatalf("expected email claim")
+	}
+}
+
+func TestPublicClientRequiresPKCE(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{Email: "pkce@example.com", Name: "PKCE User"})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	_, err = srv.clients.CreateClient(ctx, store.Client{
+		ID:           "public-client",
+		Type:         store.ClientTypePublic,
+		RedirectURIs: []string{"http://localhost/callback"},
+		GrantTypes:   []string{store.GrantAuthorizationCode},
+		Scopes:       []string{"openid"},
+	})
+	if err != nil {
+		t.Fatalf("seed public client: %v", err)
+	}
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	resp, err := client.Get(authURL)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 without PKCE, got %d", resp.StatusCode)
+	}
+
+	codeVerifier := "pkce-code-verifier-1234567890abcdef1234567890abcdef1234567"
+	challenge := pkceChallenge(codeVerifier)
+	authURL = fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s&code_challenge=%s&code_challenge_method=plain", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID), url.QueryEscape(challenge))
+	resp, err = client.Get(authURL)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 for plain PKCE, got %d", resp.StatusCode)
+	}
+
+	authURL = fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s&code_challenge=%s&code_challenge_method=S256", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID), url.QueryEscape(challenge))
+	resp, err = client.Get(authURL)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	location := resp.Header.Get("Location")
+	locURL, err := url.Parse(location)
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := locURL.Query().Get("code")
+	if code == "" {
+		t.Fatal("expected authorization code")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", "public-client")
+	form.Set("code_verifier", codeVerifier)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/oauth2/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("create token request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+	}
+}
+
+func TestRefreshTokenRotationAndReuseDetection(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{Email: "refresh@example.com", Name: "Refresh User"})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	_, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	resp, err := client.Get(authURL)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := locURL.Query().Get("code")
+	if code == "" {
+		t.Fatal("expected authorization code")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/oauth2/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("create token request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	refresh, _ := tokenResp["refresh_token"].(string)
+	if refresh == "" {
+		t.Fatal("missing refresh token")
+	}
+
+	refreshForm := url.Values{}
+	refreshForm.Set("grant_type", "refresh_token")
+	refreshForm.Set("refresh_token", refresh)
+	refreshForm.Set("client_id", testClientID)
+	refreshForm.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", refreshForm)
+	if err != nil {
+		t.Fatalf("refresh request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	var refreshResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&refreshResp); err != nil {
+		t.Fatalf("decode refresh response: %v", err)
+	}
+	newRefresh, _ := refreshResp["refresh_token"].(string)
+	if newRefresh == "" {
+		t.Fatal("missing rotated refresh token")
+	}
+	if newRefresh == refresh {
+		t.Fatal("refresh token did not rotate")
+	}
+
+	resp, err = http.PostForm(server.URL+"/oauth2/token", refreshForm)
+	if err != nil {
+		t.Fatalf("refresh request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on reuse, got %d", resp.StatusCode)
+	}
+
+	refreshForm.Set("refresh_token", newRefresh)
+	resp, err = http.PostForm(server.URL+"/oauth2/token", refreshForm)
+	if err != nil {
+		t.Fatalf("refresh request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 after family revoke, got %d", resp.StatusCode)
+	}
+}
+
+func TestIntrospectAndRevoke(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{Email: "introspect@example.com", Name: "Introspect User"})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	_, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
+	resp, err := client.Get(authURL)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("expected 302, got %d", resp.StatusCode)
+	}
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := locURL.Query().Get("code")
+	if code == "" {
+		t.Fatal("expected authorization code")
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/oauth2/token", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("create token request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	refresh, _ := tokenResp["refresh_token"].(string)
+	if refresh == "" {
+		t.Fatal("missing refresh token")
+	}
+
+	introspectForm := url.Values{}
+	introspectForm.Set("token", refresh)
+	introspectForm.Set("token_type_hint", "refresh_token")
+	introspectForm.Set("client_id", testClientID)
+	introspectForm.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/introspect", introspectForm)
+	if err != nil {
+		t.Fatalf("introspect request: %v", err)
+	}
+	defer resp.Body.Close()
+	var introspectResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&introspectResp); err != nil {
+		t.Fatalf("decode introspect response: %v", err)
+	}
+	if active, _ := introspectResp["active"].(bool); !active {
+		t.Fatal("expected refresh token active")
+	}
+
+	revokeForm := url.Values{}
+	revokeForm.Set("token", refresh)
+	revokeForm.Set("token_type_hint", "refresh_token")
+	revokeForm.Set("client_id", testClientID)
+	revokeForm.Set("client_secret", testClientSecret)
+	resp, err = http.PostForm(server.URL+"/oauth2/revoke", revokeForm)
+	if err != nil {
+		t.Fatalf("revoke request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	resp, err = http.PostForm(server.URL+"/oauth2/introspect", introspectForm)
+	if err != nil {
+		t.Fatalf("introspect request: %v", err)
+	}
+	defer resp.Body.Close()
+	introspectResp = map[string]any{}
+	if err := json.NewDecoder(resp.Body).Decode(&introspectResp); err != nil {
+		t.Fatalf("decode introspect response: %v", err)
+	}
+	if active, _ := introspectResp["active"].(bool); active {
+		t.Fatal("expected refresh token inactive after revoke")
+	}
+}
+
+func TestTokenRateLimit(t *testing.T) {
+	idStore := memstore.New()
+
+	cfg := &config.Config{
+		Issuer:          "http://test-as",
+		Audience:        "http://test-rs",
+		SigningKeyPEM:   []byte(testSigningKeyPEM),
+		SigningKeyID:    "test-key",
+		CodeTTL:         time.Minute,
+		AccessTokenTTL:  time.Hour,
+		RefreshTokenTTL: time.Hour,
+		OBOTokenTTL:     time.Minute,
+	}
+	srv, warmServer := newTestServerWithConfig(t, idStore, cfg)
+	warmServer.Close()
+
+	limiter := ratelimit.NewLimiter(1, 1)
+	mux := http.NewServeMux()
+	mux.Handle("/oauth2/token", rateLimitMiddleware(limiter, methodHandler(http.MethodPost, srv.handleToken)))
+	rateServer := httptest.NewServer(loggingMiddleware(mux))
+	defer rateServer.Close()
+
+	form := url.Values{}
+	form.Set("grant_type", "client_credentials")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err := http.PostForm(rateServer.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200, got %d", resp.StatusCode)
+	}
+
+	resp, err = http.PostForm(rateServer.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected 429, got %d", resp.StatusCode)
 	}
 }
 
@@ -587,7 +929,11 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	if err != nil {
 		t.Fatalf("seed client: %v", err)
 	}
-	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.SigningKeyID, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	keySet, err := internaljwt.LoadKeySetFromPEM(cfg.SigningKeyPEM, cfg.SigningKeyID)
+	if err != nil {
+		t.Fatalf("init signer: %v", err)
+	}
+	signer, err := internaljwt.NewSignerWithKeySet(cfg.Issuer, cfg.Audience, keySet, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
 	if err != nil {
 		t.Fatalf("init signer: %v", err)
 	}
@@ -612,6 +958,8 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
 	mux.HandleFunc("/oauth2/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
 	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.HandleFunc("/oauth2/introspect", methodHandler(http.MethodPost, srv.handleIntrospect))
+	mux.HandleFunc("/oauth2/revoke", methodHandler(http.MethodPost, srv.handleRevoke))
 	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
 	mux.HandleFunc("/register/agent", methodHandler(http.MethodPost, identityHandler.CreateAgent))
@@ -674,4 +1022,9 @@ func verifyWithJWKS(token string, jwk map[string]any) (map[string]any, error) {
 		return nil, fmt.Errorf("unmarshal claims: %w", err)
 	}
 	return claims, nil
+}
+
+func pkceChallenge(verifier string) string {
+	digest := sha256.Sum256([]byte(verifier))
+	return base64.RawURLEncoding.EncodeToString(digest[:])
 }

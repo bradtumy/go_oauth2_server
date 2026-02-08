@@ -14,6 +14,9 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
 	"go_oauth2_server/internal/random"
@@ -24,14 +27,17 @@ type MapClaims map[string]any
 
 // Signer issues JWTs for both regular access tokens and OBO tokens.
 type Signer struct {
-	issuer     string
-	audience   string
-	privateKey *rsa.PrivateKey
-	publicKey  *rsa.PublicKey
-	keyID      string
-	accessTTL  time.Duration
-	refreshTTL time.Duration
-	oboTTL     time.Duration
+	mu          sync.RWMutex
+	issuer      string
+	audience    string
+	privateKey  *rsa.PrivateKey
+	publicKey   *rsa.PublicKey
+	keyID       string
+	publicKeys  map[string]*rsa.PublicKey
+	privateKeys map[string]*rsa.PrivateKey
+	accessTTL   time.Duration
+	refreshTTL  time.Duration
+	oboTTL      time.Duration
 }
 
 var (
@@ -47,20 +53,26 @@ var (
 
 // NewSigner constructs a new Signer instance.
 func NewSigner(issuer, audience string, keyPEM []byte, keyID string, accessTTL, refreshTTL, oboTTL time.Duration) (*Signer, error) {
-	privateKey, err := parseRSAPrivateKey(keyPEM)
+	keySet, err := LoadKeySetFromPEM(keyPEM, keyID)
 	if err != nil {
-		return nil, fmt.Errorf("parse signing key: %w", err)
+		return nil, err
 	}
-	return &Signer{
+	return NewSignerWithKeySet(issuer, audience, keySet, accessTTL, refreshTTL, oboTTL)
+}
+
+// NewSignerWithKeySet constructs a new Signer with a key set.
+func NewSignerWithKeySet(issuer, audience string, keySet *KeySet, accessTTL, refreshTTL, oboTTL time.Duration) (*Signer, error) {
+	signer := &Signer{
 		issuer:     issuer,
 		audience:   audience,
-		privateKey: privateKey,
-		publicKey:  &privateKey.PublicKey,
-		keyID:      keyID,
 		accessTTL:  accessTTL,
 		refreshTTL: refreshTTL,
 		oboTTL:     oboTTL,
-	}, nil
+	}
+	if err := signer.UpdateKeys(keySet); err != nil {
+		return nil, err
+	}
+	return signer, nil
 }
 
 // IssueAccess issues a standard access token for a subject and client.
@@ -138,8 +150,12 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 		"alg": "RS256",
 		"typ": "JWT",
 	}
-	if s.keyID != "" {
-		header["kid"] = s.keyID
+	keyID, key, err := s.activeKey()
+	if err != nil {
+		return "", 0, err
+	}
+	if keyID != "" {
+		header["kid"] = keyID
 	}
 	headerJSON, err := json.Marshal(header)
 	if err != nil {
@@ -151,7 +167,7 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 	}
 	tokenUnsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
 	hash := sha256.Sum256([]byte(tokenUnsigned))
-	sig, err := rsa.SignPKCS1v15(rand.Reader, s.privateKey, crypto.SHA256, hash[:])
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
 	if err != nil {
 		return "", 0, fmt.Errorf("sign token: %w", err)
 	}
@@ -168,13 +184,25 @@ func (s *Signer) Verify(token, expectedAudience string) (MapClaims, error) {
 	if len(parts) != 3 {
 		return nil, errors.New("invalid token format")
 	}
+	header, err := parseJWTHeader(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	if alg, _ := header["alg"].(string); alg != "RS256" {
+		return nil, errors.New("unsupported jwt alg")
+	}
+	kid, _ := header["kid"].(string)
+	publicKey, err := s.publicKeyForKID(kid)
+	if err != nil {
+		return nil, err
+	}
 	unsigned := parts[0] + "." + parts[1]
 	sigBytes, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
 		return nil, fmt.Errorf("decode signature: %w", err)
 	}
 	hash := sha256.Sum256([]byte(unsigned))
-	if err := rsa.VerifyPKCS1v15(s.publicKey, crypto.SHA256, hash[:], sigBytes); err != nil {
+	if err := rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, hash[:], sigBytes); err != nil {
 		return nil, errors.New("signature mismatch")
 	}
 	payloadBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
@@ -250,20 +278,35 @@ func asInt(v any) (int64, bool) {
 
 // JWKS returns a JWK set exposing the RSA public key.
 func (s *Signer) JWKS() (map[string]any, error) {
-	if s.publicKey == nil {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.publicKeys) == 0 {
 		return nil, errors.New("missing signing key")
 	}
-	n := base64.RawURLEncoding.EncodeToString(s.publicKey.N.Bytes())
-	e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(s.publicKey.E)).Bytes())
-	jwk := map[string]any{
-		"kty": "RSA",
-		"alg": "RS256",
-		"n":   n,
-		"e":   e,
-		"kid": s.keyID,
-		"use": "sig",
+	keyIDs := make([]string, 0, len(s.publicKeys))
+	for keyID := range s.publicKeys {
+		keyIDs = append(keyIDs, keyID)
 	}
-	return map[string]any{"keys": []any{jwk}}, nil
+	sort.Strings(keyIDs)
+	keys := make([]any, 0, len(keyIDs))
+	for _, keyID := range keyIDs {
+		publicKey := s.publicKeys[keyID]
+		if publicKey == nil {
+			continue
+		}
+		n := base64.RawURLEncoding.EncodeToString(publicKey.N.Bytes())
+		e := base64.RawURLEncoding.EncodeToString(big.NewInt(int64(publicKey.E)).Bytes())
+		jwk := map[string]any{
+			"kty": "RSA",
+			"alg": "RS256",
+			"n":   n,
+			"e":   e,
+			"kid": keyID,
+			"use": "sig",
+		}
+		keys = append(keys, jwk)
+	}
+	return map[string]any{"keys": keys}, nil
 }
 
 // ComputeSubjectHash returns a stable hash for subject entitlements.
@@ -284,6 +327,64 @@ func (s *Signer) Issuer() string {
 	return s.issuer
 }
 
+// UpdateKeys swaps the active key set for signing and verification.
+func (s *Signer) UpdateKeys(keySet *KeySet) error {
+	if keySet == nil || len(keySet.PrivateKeys) == 0 {
+		return errors.New("missing signing key set")
+	}
+	activeKeyID := keySet.ActiveKeyID
+	if strings.TrimSpace(activeKeyID) == "" {
+		return errors.New("active key id required")
+	}
+	privateKey, ok := keySet.PrivateKeys[activeKeyID]
+	if !ok || privateKey == nil {
+		return fmt.Errorf("active signing key %q not found", activeKeyID)
+	}
+	publicKeys := keySet.PublicKeys
+	if len(publicKeys) == 0 {
+		publicKeys = map[string]*rsa.PublicKey{}
+		for id, key := range keySet.PrivateKeys {
+			if key != nil {
+				publicKeys[id] = &key.PublicKey
+			}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.keyID = activeKeyID
+	s.privateKey = privateKey
+	s.publicKey = &privateKey.PublicKey
+	s.publicKeys = publicKeys
+	s.privateKeys = keySet.PrivateKeys
+	return nil
+}
+
+func (s *Signer) activeKey() (string, *rsa.PrivateKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.privateKey == nil {
+		return "", nil, errors.New("missing signing key")
+	}
+	return s.keyID, s.privateKey, nil
+}
+
+func (s *Signer) publicKeyForKID(kid string) (*rsa.PublicKey, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if kid == "" {
+		if s.publicKey == nil {
+			return nil, errors.New("missing signing key")
+		}
+		return s.publicKey, nil
+	}
+	if s.publicKeys != nil {
+		if key, ok := s.publicKeys[kid]; ok && key != nil {
+			return key, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown kid %q", kid)
+}
+
 func parseRSAPrivateKey(keyPEM []byte) (*rsa.PrivateKey, error) {
 	block, _ := pem.Decode(keyPEM)
 	if block == nil {
@@ -301,6 +402,18 @@ func parseRSAPrivateKey(keyPEM []byte) (*rsa.PrivateKey, error) {
 		return nil, errors.New("not RSA private key")
 	}
 	return key, nil
+}
+
+func parseJWTHeader(headerSegment string) (map[string]any, error) {
+	headerBytes, err := base64.RawURLEncoding.DecodeString(headerSegment)
+	if err != nil {
+		return nil, fmt.Errorf("decode header: %w", err)
+	}
+	var header map[string]any
+	if err := json.Unmarshal(headerBytes, &header); err != nil {
+		return nil, fmt.Errorf("unmarshal header: %w", err)
+	}
+	return header, nil
 }
 
 func stringsSplit(s string, sep rune) []string {

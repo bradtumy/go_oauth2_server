@@ -3,11 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +24,7 @@ import (
 	internaljwt "go_oauth2_server/internal/jwt"
 	"go_oauth2_server/internal/obo"
 	"go_oauth2_server/internal/random"
+	"go_oauth2_server/internal/ratelimit"
 	"go_oauth2_server/internal/store"
 	memstore "go_oauth2_server/internal/store/mem"
 	sqlstore "go_oauth2_server/internal/store/sqlite"
@@ -50,9 +53,12 @@ func main() {
 		}
 	}
 
-	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.SigningKeyID, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	signer, err := buildSigner(cfg)
 	if err != nil {
 		log.Fatalf("init signer: %v", err)
+	}
+	if cfg.SigningKeyDir != "" && cfg.SigningKeyRotationInterval > 0 {
+		startKeyRotation(cfg, signer)
 	}
 	oboService := &obo.Service{Signer: signer, Issuer: cfg.Issuer, Audience: cfg.Audience, OBOTTL: cfg.OBOTokenTTL}
 
@@ -69,16 +75,22 @@ func main() {
 	}
 
 	identityHandler := identity.NewHandler(identityStore, cfg.AdminToken)
+	authorizeLimiter := ratelimit.NewLimiter(float64(cfg.AuthorizeRateLimitRPS), cfg.AuthorizeRateLimitBurst)
+	tokenLimiter := ratelimit.NewLimiter(float64(cfg.TokenRateLimitRPS), cfg.TokenRateLimitBurst)
+	introspectLimiter := ratelimit.NewLimiter(float64(cfg.IntrospectRateLimitRPS), cfg.IntrospectRateLimitBurst)
+	adminLimiter := ratelimit.NewLimiter(float64(cfg.AdminRateLimitRPS), cfg.AdminRateLimitBurst)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", methodHandler(http.MethodGet, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	}))
-	mux.HandleFunc("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
-	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
-	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
-	mux.HandleFunc("/oauth2/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
-	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.Handle("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
+	mux.Handle("/authorize", rateLimitMiddleware(authorizeLimiter, methodHandler(http.MethodGet, srv.handleAuthorize)))
+	mux.Handle("/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
+	mux.Handle("/oauth2/authorize", rateLimitMiddleware(authorizeLimiter, methodHandler(http.MethodGet, srv.handleAuthorize)))
+	mux.Handle("/oauth2/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
+	mux.Handle("/oauth2/introspect", rateLimitMiddleware(introspectLimiter, methodHandler(http.MethodPost, srv.handleIntrospect)))
+	mux.Handle("/oauth2/revoke", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleRevoke)))
 	mux.HandleFunc("/mint-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
 	mux.HandleFunc("/register/human", methodHandler(http.MethodPost, identityHandler.CreateHuman))
@@ -115,10 +127,11 @@ func main() {
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("/admin/clients", adminHandler.HandleClients)
 	adminMux.HandleFunc("/admin/clients/", adminHandler.HandleClient)
+	adminHandlerWithLimit := rateLimitMiddleware(adminLimiter, adminMux)
 
 	go func() {
 		log.Printf("Admin API listening on %s", cfg.AdminAddr)
-		if err := http.ListenAndServe(cfg.AdminAddr, loggingMiddleware(adminMux)); err != nil {
+		if err := http.ListenAndServe(cfg.AdminAddr, loggingMiddleware(adminHandlerWithLimit)); err != nil {
 			log.Fatalf("admin listen: %v", err)
 		}
 	}()
@@ -320,15 +333,37 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		return
 	}
 
+	codeChallenge := strings.TrimSpace(q.Get("code_challenge"))
+	codeChallengeMethod := strings.ToUpper(strings.TrimSpace(q.Get("code_challenge_method")))
+	if codeChallenge != "" && codeChallengeMethod == "" {
+		codeChallengeMethod = "PLAIN"
+	}
+	if client.Type == store.ClientTypePublic {
+		if codeChallenge == "" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge required for public clients")
+			return
+		}
+		if codeChallengeMethod != "S256" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
+			return
+		}
+	} else if codeChallenge != "" && codeChallengeMethod != "S256" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge_method must be S256")
+		return
+	}
+
 	code := random.NewID()
 	state := q.Get("state")
 	s.store.SaveCode(store.AuthorizationCode{
-		Code:        code,
-		ClientID:    clientID,
-		HumanID:     human.ID,
-		RedirectURI: redirectURI,
-		Scope:       scope,
-		ExpiresAt:   time.Now().Add(s.cfg.CodeTTL),
+		Code:                code,
+		ClientID:            clientID,
+		HumanID:             human.ID,
+		RedirectURI:         redirectURI,
+		Scope:               scope,
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: codeChallengeMethod,
+		IssuedAt:            time.Now().UTC(),
+		ExpiresAt:           time.Now().Add(s.cfg.CodeTTL),
 	})
 
 	redirect, err := url.Parse(redirectURI)
@@ -371,6 +406,88 @@ func (s *authorizationServer) handleToken(w http.ResponseWriter, r *http.Request
 	default:
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant type not supported")
 	}
+}
+
+func (s *authorizationServer) handleIntrospect(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unable to parse form")
+		return
+	}
+	client, err := s.authenticateClient(r, "")
+	if err != nil {
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
+		return
+	}
+	token := strings.TrimSpace(r.PostFormValue("token"))
+	if token == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "token required")
+		return
+	}
+	tokenTypeHint := strings.TrimSpace(r.PostFormValue("token_type_hint"))
+	if tokenTypeHint == "" || tokenTypeHint == "refresh_token" {
+		if rt, ok := s.store.GetRefreshToken(token); ok && rt.ClientID == client.ID {
+			active := time.Now().Before(rt.ExpiresAt) && rt.ConsumedAt.IsZero()
+			writeJSON(w, http.StatusOK, map[string]any{
+				"active":     active,
+				"sub":        rt.HumanID,
+				"client_id":  rt.ClientID,
+				"scope":      rt.Scope,
+				"exp":        rt.ExpiresAt.Unix(),
+				"iat":        rt.IssuedAt.Unix(),
+				"token_type": "refresh_token",
+			})
+			return
+		}
+		if tokenTypeHint == "refresh_token" {
+			writeJSON(w, http.StatusOK, map[string]any{"active": false})
+			return
+		}
+	}
+
+	claims, err := s.verifyAccessToken(token)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	sub, _ := claims["sub"].(string)
+	scope, _ := claims["scope"].(string)
+	clientID, _ := claims["client_id"].(string)
+	exp, _ := claims["exp"]
+	iat, _ := claims["iat"]
+	aud := claims["aud"]
+	iss := claims["iss"]
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":     true,
+		"sub":        sub,
+		"client_id":  clientID,
+		"scope":      scope,
+		"exp":        exp,
+		"iat":        iat,
+		"aud":        aud,
+		"iss":        iss,
+		"token_type": "access_token",
+	})
+}
+
+func (s *authorizationServer) handleRevoke(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unable to parse form")
+		return
+	}
+	if _, err := s.authenticateClient(r, ""); err != nil {
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
+		return
+	}
+	token := strings.TrimSpace(r.PostFormValue("token"))
+	if token == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "token required")
+		return
+	}
+	tokenTypeHint := strings.TrimSpace(r.PostFormValue("token_type_hint"))
+	if tokenTypeHint == "" || tokenTypeHint == "refresh_token" {
+		s.store.RevokeRefreshTokenFamily(token)
+	}
+	w.WriteHeader(http.StatusOK)
 }
 
 func (s *authorizationServer) handleSubjectAssertion(w http.ResponseWriter, r *http.Request) {
@@ -443,6 +560,20 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
 		return
 	}
+	if record.CodeChallenge != "" {
+		codeVerifier := strings.TrimSpace(r.PostFormValue("code_verifier"))
+		if !validCodeVerifier(codeVerifier) {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid code_verifier")
+			return
+		}
+		if !verifyPKCE(record.CodeChallengeMethod, record.CodeChallenge, codeVerifier) {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier mismatch")
+			return
+		}
+	} else if client.Type == store.ClientTypePublic {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier required for public clients")
+		return
+	}
 	if !scopeSubsetList(record.Scope, client.Scopes) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
 		return
@@ -467,11 +598,14 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 		return
 	}
 	refresh := random.NewID()
+	familyID := random.NewID()
 	s.store.SaveRefreshToken(store.RefreshToken{
 		Token:     refresh,
 		ClientID:  client.ID,
 		HumanID:   human.ID,
 		Scope:     record.Scope,
+		FamilyID:  familyID,
+		IssuedAt:  time.Now().UTC(),
 		ExpiresAt: time.Now().Add(s.cfg.RefreshTokenTTL),
 	})
 	writeTokenResponse(w, map[string]any{
@@ -494,12 +628,17 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown refresh token")
 		return
 	}
+	if !rt.ConsumedAt.IsZero() {
+		s.store.RevokeRefreshTokenFamily(token)
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected")
+		return
+	}
 	if !scopeSubsetList(rt.Scope, client.Scopes) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
 		return
 	}
 	if time.Now().After(rt.ExpiresAt) {
-		s.store.DeleteRefreshToken(token)
+		s.store.RevokeRefreshTokenFamily(token)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
@@ -517,11 +656,30 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+	newRefresh := random.NewID()
+	next := store.RefreshToken{
+		Token:     newRefresh,
+		ClientID:  rt.ClientID,
+		HumanID:   rt.HumanID,
+		Scope:     rt.Scope,
+		FamilyID:  rt.FamilyID,
+		IssuedAt:  time.Now().UTC(),
+		ExpiresAt: rt.ExpiresAt,
+	}
+	if _, err := s.store.RotateRefreshToken(token, next); err != nil {
+		if errors.Is(err, store.ErrRefreshTokenConsumed) || errors.Is(err, store.ErrRefreshTokenFamilyReset) {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected")
+			return
+		}
+		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown refresh token")
+		return
+	}
 	writeTokenResponse(w, map[string]any{
-		"access_token": access,
-		"token_type":   "bearer",
-		"expires_in":   expiresIn,
-		"scope":        rt.Scope,
+		"access_token":  access,
+		"token_type":    "bearer",
+		"expires_in":    expiresIn,
+		"refresh_token": newRefresh,
+		"scope":         rt.Scope,
 	})
 }
 
@@ -745,12 +903,72 @@ func writeOAuthError(w http.ResponseWriter, status int, code, description string
 	})
 }
 
+func rateLimitMiddleware(limiter *ratelimit.Limiter, next http.Handler) http.Handler {
+	if limiter == nil {
+		return next
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow(clientIP(r)) {
+			writeOAuthError(w, http.StatusTooManyRequests, "rate_limited", "too many requests")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func clientIP(r *http.Request) string {
+	if forwarded := r.Header.Get("X-Forwarded-For"); forwarded != "" {
+		parts := strings.Split(forwarded, ",")
+		if len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start))
 	})
+}
+
+func validCodeVerifier(verifier string) bool {
+	if len(verifier) < 43 || len(verifier) > 128 {
+		return false
+	}
+	for _, r := range verifier {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '.' || r == '_' || r == '~' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func verifyPKCE(method, challenge, verifier string) bool {
+	if method != "S256" {
+		return false
+	}
+	digest := sha256.Sum256([]byte(verifier))
+	expected := base64.RawURLEncoding.EncodeToString(digest[:])
+	return subtleConstantTimeCompare(expected, challenge)
+}
+
+func subtleConstantTimeCompare(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := 0; i < len(a); i++ {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }
 
 func methodHandler(method string, fn http.HandlerFunc) http.HandlerFunc {
@@ -797,7 +1015,7 @@ func loadDotEnv() {
 }
 
 func logConfiguration(cfg *config.Config) {
-	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s client_store=%s clients_db=%s admin_addr=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.ClientStoreDriver, cfg.ClientDBPath, cfg.AdminAddr, cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s client_store=%s clients_db=%s admin_addr=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s signing_key_dir=%s key_rotation_interval=%s authorize_rl=%d/%d token_rl=%d/%d introspect_rl=%d/%d admin_rl=%d/%d", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.ClientStoreDriver, cfg.ClientDBPath, cfg.AdminAddr, cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL, cfg.SigningKeyDir, cfg.SigningKeyRotationInterval, cfg.AuthorizeRateLimitRPS, cfg.AuthorizeRateLimitBurst, cfg.TokenRateLimitRPS, cfg.TokenRateLimitBurst, cfg.IntrospectRateLimitRPS, cfg.IntrospectRateLimitBurst, cfg.AdminRateLimitRPS, cfg.AdminRateLimitBurst)
 }
 
 func buildClientStore(cfg *config.Config) (store.ClientStore, error) {
@@ -905,6 +1123,55 @@ func scopeSubset(requested string, subjectScope any) bool {
 		}
 	}
 	return true
+}
+
+func (s *authorizationServer) verifyAccessToken(token string) (internaljwt.MapClaims, error) {
+	claims, err := s.signer.Verify(token, s.cfg.Audience)
+	if err == nil {
+		return claims, nil
+	}
+	if s.cfg.Issuer != "" && s.cfg.Issuer != s.cfg.Audience {
+		return s.signer.Verify(token, s.cfg.Issuer)
+	}
+	return nil, err
+}
+
+func buildSigner(cfg *config.Config) (*internaljwt.Signer, error) {
+	var (
+		keySet *internaljwt.KeySet
+		err    error
+	)
+	if cfg.SigningKeyDir != "" {
+		keySet, err = internaljwt.LoadKeySetFromDir(cfg.SigningKeyDir, cfg.SigningKeyID)
+	} else {
+		keySet, err = internaljwt.LoadKeySetFromPEM(cfg.SigningKeyPEM, cfg.SigningKeyID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return internaljwt.NewSignerWithKeySet(cfg.Issuer, cfg.Audience, keySet, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL)
+}
+
+func startKeyRotation(cfg *config.Config, signer *internaljwt.Signer) {
+	interval := cfg.SigningKeyRotationInterval
+	if interval <= 0 || cfg.SigningKeyDir == "" {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	go func() {
+		for range ticker.C {
+			keySet, err := internaljwt.LoadKeySetFromDir(cfg.SigningKeyDir, cfg.SigningKeyID)
+			if err != nil {
+				log.Printf("key rotation reload failed: %v", err)
+				continue
+			}
+			if err := signer.UpdateKeys(keySet); err != nil {
+				log.Printf("key rotation update failed: %v", err)
+				continue
+			}
+			log.Printf("key rotation: reloaded %d keys (active kid=%s)", len(keySet.PrivateKeys), keySet.ActiveKeyID)
+		}
+	}()
 }
 
 func seedIdentities(ctx context.Context, store identity.Store, path string) error {
