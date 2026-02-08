@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"go_oauth2_server/internal/config"
 	internaljwt "go_oauth2_server/internal/jwt"
 )
 
@@ -20,7 +20,10 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	signer := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKey, cfg.KeyID, cfg.AccessTTL, cfg.RefreshTTL, cfg.AccessTTL)
+	signer, err := internaljwt.NewSigner(cfg.Issuer, cfg.Audience, cfg.SigningKeyPEM, cfg.KeyID, cfg.AccessTTL, cfg.RefreshTTL, cfg.AccessTTL)
+	if err != nil {
+		log.Fatalf("init signer: %v", err)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -69,12 +72,12 @@ func main() {
 }
 
 type resourceConfig struct {
-	Issuer     string
-	Audience   string
-	SigningKey []byte
-	KeyID      string
-	AccessTTL  time.Duration
-	RefreshTTL time.Duration
+	Issuer        string
+	Audience      string
+	SigningKeyPEM []byte
+	KeyID         string
+	AccessTTL     time.Duration
+	RefreshTTL    time.Duration
 }
 
 func loadConfig() (*resourceConfig, error) {
@@ -83,18 +86,17 @@ func loadConfig() (*resourceConfig, error) {
 		issuer = getEnv("AS_ISSUER", "http://as:8080")
 	}
 	audience := getEnv("RS_AUDIENCE", "http://localhost:9090")
-	keyB64 := getEnv("AS_SIGNING_KEY_BASE64", "ZGV2LXNpZ25pbmcta2V5LTEyMzQ=")
-	key, err := base64.StdEncoding.DecodeString(keyB64)
+	key, err := config.Load()
 	if err != nil {
-		return nil, fmt.Errorf("decode signing key: %w", err)
+		return nil, fmt.Errorf("load config: %w", err)
 	}
 	return &resourceConfig{
-		Issuer:     issuer,
-		Audience:   audience,
-		SigningKey: key,
-		KeyID:      getEnv("AS_SIGNING_KEY_ID", "dev-hs256"),
-		AccessTTL:  15 * time.Minute,
-		RefreshTTL: 24 * time.Hour,
+		Issuer:        issuer,
+		Audience:      audience,
+		SigningKeyPEM: key.SigningKeyPEM,
+		KeyID:         getEnv("AS_SIGNING_KEY_ID", "dev-rs256"),
+		AccessTTL:     15 * time.Minute,
+		RefreshTTL:    24 * time.Hour,
 	}, nil
 }
 
