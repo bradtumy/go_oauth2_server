@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"go_oauth2_server/internal/identity"
-	"go_oauth2_server/internal/random"
+	"tokenator/internal/identity"
+	"tokenator/internal/random"
 )
 
 const (

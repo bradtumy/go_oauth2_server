@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"go_oauth2_server/internal/identity"
+	"tokenator/internal/identity"
 )
 
 func TestHumanCRUD(t *testing.T) {

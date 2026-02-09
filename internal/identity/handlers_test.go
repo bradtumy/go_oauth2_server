@@ -8,8 +8,8 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"go_oauth2_server/internal/identity"
-	memstore "go_oauth2_server/internal/store/mem"
+	"tokenator/internal/identity"
+	memstore "tokenator/internal/store/mem"
 )
 
 func TestCreateHumanHandler(t *testing.T) {

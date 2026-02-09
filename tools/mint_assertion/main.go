@@ -8,8 +8,8 @@ import (
 	"os"
 	"time"
 
-	"go_oauth2_server/internal/assertion"
-	"go_oauth2_server/internal/random"
+	"tokenator/internal/assertion"
+	"tokenator/internal/random"
 )
 
 func main() {

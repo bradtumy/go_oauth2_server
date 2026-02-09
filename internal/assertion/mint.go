@@ -8,7 +8,7 @@ import (
 	"errors"
 	"time"
 
-	"go_oauth2_server/internal/random"
+	"tokenator/internal/random"
 )
 
 var (

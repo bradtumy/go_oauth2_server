@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"go_oauth2_server/internal/config"
-	internaljwt "go_oauth2_server/internal/jwt"
+	"tokenator/internal/config"
+	internaljwt "tokenator/internal/jwt"
 )
 
 func main() {
