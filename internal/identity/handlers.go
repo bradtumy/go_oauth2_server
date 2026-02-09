@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"crypto/subtle"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Handler struct {
@@ -36,11 +38,24 @@ func (h *Handler) CreateHuman(w http.ResponseWriter, r *http.Request) {
 		writeValidationError(w, err)
 		return
 	}
+
+	// Hash password if provided
+	var passwordHash string
+	if sanitized.Password != "" {
+		hash, err := bcrypt.GenerateFromPassword([]byte(sanitized.Password), bcrypt.DefaultCost)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "server_error", "password hashing failed", nil)
+			return
+		}
+		passwordHash = string(hash)
+	}
+
 	human, err := h.Store.CreateHuman(r.Context(), Human{
-		Email:      sanitized.Email,
-		Name:       sanitized.Name,
-		TenantID:   sanitized.TenantID,
-		Attributes: sanitized.Attributes,
+		Email:        sanitized.Email,
+		Name:         sanitized.Name,
+		PasswordHash: passwordHash,
+		TenantID:     sanitized.TenantID,
+		Attributes:   sanitized.Attributes,
 	})
 	if err != nil {
 		if errors.Is(err, ErrHumanEmailExists) {

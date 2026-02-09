@@ -29,3 +29,18 @@ services:
       - "9090:9090"
     depends_on:
       - as
+  oauth-client:
+    build:
+      context: ./examples/oauth-client
+      dockerfile: Dockerfile
+    image: tokenator-oauth-client:latest
+    container_name: tokenator-oauth-client
+    environment:
+      - AUTH_URL=http://as:8080/oauth2/authorize
+      - TOKEN_URL=http://as:8080/oauth2/token
+      - RS_URL=http://rs:9090
+    ports:
+      - "5555:5555"
+    depends_on:
+      - as
+      - rs

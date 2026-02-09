@@ -79,6 +79,8 @@ fi
 
 echo "✓ OBO token obtained"
 echo ""
+printf "OBO Token: %s\n" "${OBO_TOKEN}"
+echo ""
 
 # Step 2: Call resource server
 echo "Calling resource server..."

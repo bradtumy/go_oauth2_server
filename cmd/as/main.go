@@ -19,12 +19,14 @@ import (
 	"time"
 
 	"tokenator/internal/admin"
+	"tokenator/internal/auth"
 	"tokenator/internal/config"
 	"tokenator/internal/identity"
 	internaljwt "tokenator/internal/jwt"
 	"tokenator/internal/obo"
 	"tokenator/internal/random"
 	"tokenator/internal/ratelimit"
+	"tokenator/internal/session"
 	"tokenator/internal/store"
 	memstore "tokenator/internal/store/mem"
 	sqlstore "tokenator/internal/store/sqlite"
@@ -53,6 +55,19 @@ func main() {
 		}
 	}
 
+	// Initialize session store with 30 minute idle timeout
+	sessionStore := session.NewMemoryStore(30 * time.Minute)
+
+	// Initialize authentication handler
+	authHandler, err := auth.NewHandler(sessionStore, identityStore, cfg.DevMode)
+	if err != nil {
+		log.Fatalf("init auth handler: %v", err)
+	}
+
+	// Start session cleanup worker (runs every 15 minutes)
+	authHandler.StartCleanupWorker(15 * time.Minute)
+	log.Printf("Session cleanup worker started (interval: 15m, idle timeout: 30m)")
+
 	signer, err := buildSigner(cfg)
 	if err != nil {
 		log.Fatalf("init signer: %v", err)
@@ -69,6 +84,7 @@ func main() {
 		signer:             signer,
 		oboService:         oboService,
 		identities:         identityStore,
+		authHandler:        authHandler,
 		allowLegacy:        cfg.AllowLegacy,
 		legacyUsers:        map[string]string{"user:123": "demo-user"},
 		legacyDefaultHuman: "user:123",
@@ -85,9 +101,24 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	}))
 	mux.Handle("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
-	mux.Handle("/authorize", rateLimitMiddleware(authorizeLimiter, methodHandler(http.MethodGet, srv.handleAuthorize)))
+
+	// Authentication routes
+	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			authHandler.ShowLogin(w, r)
+		} else if r.Method == http.MethodPost {
+			authHandler.HandleLogin(w, r)
+		} else {
+			methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+		}
+	})
+	mux.HandleFunc("/logout", authHandler.HandleLogout)
+	mux.Handle("/consent", authHandler.RequireAuth(methodHandler(http.MethodPost, srv.handleConsent)))
+
+	// OAuth routes with authentication required
+	mux.Handle("/authorize", rateLimitMiddleware(authorizeLimiter, authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize))))
 	mux.Handle("/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
-	mux.Handle("/oauth2/authorize", rateLimitMiddleware(authorizeLimiter, methodHandler(http.MethodGet, srv.handleAuthorize)))
+	mux.Handle("/oauth2/authorize", rateLimitMiddleware(authorizeLimiter, authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize))))
 	mux.Handle("/oauth2/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
 	mux.Handle("/oauth2/introspect", rateLimitMiddleware(introspectLimiter, methodHandler(http.MethodPost, srv.handleIntrospect)))
 	mux.Handle("/oauth2/revoke", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleRevoke)))
@@ -149,6 +180,7 @@ type authorizationServer struct {
 	signer             *internaljwt.Signer
 	oboService         *obo.Service
 	identities         identity.Store
+	authHandler        *auth.Handler
 	allowLegacy        bool
 	legacyUsers        map[string]string
 	legacyDefaultHuman string
@@ -277,11 +309,22 @@ func (s *authorizationServer) handleJWKS(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
+	// Get authenticated session from context (RequireAuth middleware ensures this exists)
+	sess, ok := auth.SessionFromContext(r.Context())
+	if !ok {
+		// Should never happen due to RequireAuth middleware
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
 	q := r.URL.Query()
+
+	// Validate OAuth parameters
 	if !strings.EqualFold(q.Get("response_type"), "code") {
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_response_type", "only authorization_code supported")
 		return
 	}
+
 	clientID := q.Get("client_id")
 	client, ok, err := s.clients.GetClient(r.Context(), clientID)
 	if err != nil {
@@ -292,10 +335,12 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		writeOAuthError(w, http.StatusBadRequest, "unauthorized_client", "unknown client")
 		return
 	}
+
 	if !clientAllowsGrant(client, store.GrantAuthorizationCode) {
 		writeOAuthError(w, http.StatusBadRequest, "unauthorized_client", "authorization_code not allowed")
 		return
 	}
+
 	redirectURI := strings.TrimSpace(q.Get("redirect_uri"))
 	if redirectURI == "" {
 		if len(client.RedirectURIs) == 1 {
@@ -305,25 +350,12 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 			return
 		}
 	}
+
 	if !redirectURIMatch(client.RedirectURIs, redirectURI) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "redirect_uri mismatch")
 		return
 	}
-	human, err := s.resolveHumanSelection(r.Context(), q.Get("human_id"), q.Get("email"))
-	if err != nil {
-		status := http.StatusBadRequest
-		description := err.Error()
-		switch {
-		case errors.Is(err, errHumanSelectionRequired):
-			description = "human_id or email is required"
-		case errors.Is(err, identity.ErrHumanNotFound):
-			description = "requested human not found"
-		default:
-			status = http.StatusInternalServerError
-		}
-		writeOAuthError(w, status, "invalid_request", description)
-		return
-	}
+
 	scope := q.Get("scope")
 	if scope == "" {
 		scope = strings.Join(client.Scopes, " ")
@@ -338,6 +370,7 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 	if codeChallenge != "" && codeChallengeMethod == "" {
 		codeChallengeMethod = "PLAIN"
 	}
+
 	if client.Type == store.ClientTypePublic {
 		if codeChallenge == "" {
 			writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code_challenge required for public clients")
@@ -352,12 +385,46 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	code := random.NewID()
 	state := q.Get("state")
+
+	// Show consent page (user must approve before we issue a code)
+	s.authHandler.ShowConsent(w, r, sess, client, scope, redirectURI, state, codeChallenge, codeChallengeMethod)
+}
+
+func (s *authorizationServer) handleConsent(w http.ResponseWriter, r *http.Request) {
+	// Get authenticated session (RequireAuth middleware ensures this exists)
+	sess, ok := auth.SessionFromContext(r.Context())
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Parse consent decision from form
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid form data", http.StatusBadRequest)
+		return
+	}
+
+	action := r.PostFormValue("action")
+	clientID := r.PostFormValue("client_id")
+	redirectURI := r.PostFormValue("redirect_uri")
+	scope := r.PostFormValue("scope")
+	state := r.PostFormValue("state")
+	codeChallenge := r.PostFormValue("code_challenge")
+	codeChallengeMethod := r.PostFormValue("code_challenge_method")
+
+	// User denied consent
+	if action != "approve" {
+		auth.RedirectWithError(w, r, redirectURI, "access_denied", "User denied authorization", state)
+		return
+	}
+
+	// User approved - generate authorization code
+	code := random.NewID()
 	s.store.SaveCode(store.AuthorizationCode{
 		Code:                code,
 		ClientID:            clientID,
-		HumanID:             human.ID,
+		HumanID:             sess.HumanID,
 		RedirectURI:         redirectURI,
 		Scope:               scope,
 		CodeChallenge:       codeChallenge,
@@ -366,9 +433,10 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 		ExpiresAt:           time.Now().Add(s.cfg.CodeTTL),
 	})
 
+	// Redirect to client with code
 	redirect, err := url.Parse(redirectURI)
 	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "invalid redirect_uri")
+		http.Error(w, "Invalid redirect_uri", http.StatusBadRequest)
 		return
 	}
 	values := redirect.Query()

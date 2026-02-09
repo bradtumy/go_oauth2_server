@@ -47,6 +47,7 @@ func (v *ValidationError) hasErrors() bool {
 type HumanInput struct {
 	Email      string            `json:"email"`
 	Name       string            `json:"name"`
+	Password   string            `json:"password"` // Optional: plaintext password for initial setup
 	TenantID   string            `json:"tenant_id"`
 	Attributes map[string]string `json:"attributes"`
 }

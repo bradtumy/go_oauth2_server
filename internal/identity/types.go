@@ -15,12 +15,13 @@ var (
 )
 
 type Human struct {
-	ID         string            `json:"id"`
-	Email      string            `json:"email"`
-	Name       string            `json:"name"`
-	TenantID   string            `json:"tenant_id"`
-	Attributes map[string]string `json:"attributes,omitempty"`
-	CreatedAt  time.Time         `json:"created_at"`
+	ID           string            `json:"id"`
+	Email        string            `json:"email"`
+	Name         string            `json:"name"`
+	PasswordHash string            `json:"-"` // Bcrypt hash, never expose in JSON
+	TenantID     string            `json:"tenant_id"`
+	Attributes   map[string]string `json:"attributes,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
 }
 
 type Agent struct {
