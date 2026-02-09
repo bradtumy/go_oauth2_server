@@ -1,84 +1,130 @@
 # tokenator
 
-An educational OAuth 2.0 authorisation server and companion resource server written in Go. The service supports:
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-- The authorisation code, refresh token, and client credentials grants.
-- [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) Token Exchange for on-behalf-of (OBO) delegation.
-- Rich authorisation requests (`authorization_details`) with permission hashing.
-- Identity registration APIs for both humans and agents that drive every OAuth/OBO flow.
+An educational OAuth 2.0 authorization server and companion resource server written in Go, demonstrating modern OAuth flows including on-behalf-of (OBO) delegation.
 
-The project is intended for local development and demo scenarios. Tokens are JSON Web Tokens (JWTs) signed with RSA keys; the resource server verifies them using the same key material and a published JWKS endpoint.
+## Features
+
+- ✅ **Standard OAuth 2.0 Grants**: Authorization code with PKCE, client credentials, refresh token
+- ✅ **RFC 8693 Token Exchange**: On-behalf-of (OBO) delegation for agent-on-human scenarios
+- ✅ **Rich Authorization Requests**: Fine-grained permissions with `authorization_details`
+- ✅ **Identity Management**: Built-in APIs for human and agent identity registration
+- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting
+- ✅ **JWT Tokens**: Self-contained JWTs with RSA signatures and JWKS endpoint
+- ✅ **Admin API**: Dynamic client registration and management
+- ✅ **Test Scripts**: Automated end-to-end test suite in `/scripts`
+
+**Intended for:** Local development, demos, OAuth learning, and prototyping. See [Production Readiness](#production-readiness) for deployment considerations.
 
 ## Contents
 
+- [Features](#features)
+- [Quick Start](#quick-start)
 - [Architecture](#architecture)
-- [Quickstart](#quickstart)
+- [Usage Guide](#usage-guide)
   - [Prerequisites](#prerequisites)
-  - [Core Workflows](#core-workflows)
+  - [Running Locally](#running-locally)
+  - [Running with Docker](#running-with-docker)
+  - [Seeding OAuth Clients](#seeding-oauth-clients)
+- [OAuth Workflows](#oauth-workflows)
+  - [1. Client Credentials (Machine-to-Machine)](#1-client-credentials-machine-to-machine)
+  - [2. Authorization Code with PKCE (User Auth)](#2-authorization-code-with-pkce-user-auth)
+  - [3. Refresh Token Grant](#3-refresh-token-grant)
+  - [4. Token Exchange (On-Behalf-Of)](#4-token-exchange-on-behalf-of)
+  - [5. Resource Server Access](#5-resource-server-access)
+- [API Reference](#api-reference)
+  - [Identity Registration](#identity-registration)
   - [Token Introspection](#token-introspection)
   - [Token Revocation](#token-revocation)
-  - [Admin API Operations](#admin-api-operations)
+  - [Admin API](#admin-api)
   - [JWKS Endpoint](#jwks-endpoint)
   - [Health Checks](#health-checks)
-  - [Common Patterns](#common-patterns)
-  - [Debugging Tips](#debugging-tips)
-- [Production Readiness](#production-readiness)
-- [Prerequisites](#prerequisites)
-- [Running locally](#running-locally)
-- [Running with Docker Compose](#running-with-docker-compose)
-- [Identity Registration & End-to-End OAuth/OBO with Registered Identities](#identity-registration--end-to-end-oauthobo-with-registered-identities)
-  - [1. Run the services](#1-run-the-services)
-  - [2. Register identities](#2-register-identities)
-  - [3. Authorisation code flow](#3-authorisation-code-flow)
-  - [4. Mint a subject assertion](#4-mint-a-subject-assertion)
-  - [5. Perform RFC 8693 token exchange](#5-perform-rfc-8693-token-exchange)
-  - [6. Call the resource server](#6-call-the-resource-server)
-  - [7. Negative tests](#7-negative-tests)
-  - [Postman collection](#postman-collection)
+- [Test Scripts](#test-scripts)
+- [Troubleshooting](#troubleshooting)
 - [Tests](#tests)
 - [Configuration](#configuration)
-- [Project layout](#project-layout)
+- [Production Readiness](#production-readiness)
+- [Project Structure](#project-structure)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Quick Start
+
+Get tokenator running in 3 minutes:
+
+```bash
+# 1. Clone and navigate to the project
+git clone https://github.com/bradtumy/tokenator.git
+cd tokenator
+
+# 2. Start services with Docker
+docker compose up -d
+
+# 3. Seed OAuth clients
+make seed
+
+# 4. Run end-to-end test
+./scripts/test_complete_obo_flow.sh
+```
+
+**What just happened?**
+- Authorization Server started on `:8080`
+- Resource Server started on `:9090`
+- Demo OAuth clients registered
+- Complete OBO flow executed: identity registration → token exchange → resource access
+
+📖 **Next:** Explore individual workflows in the [OAuth Workflows](#oauth-workflows) section or see [Test Scripts](#test-scripts) for automated testing.
 
 ## Architecture
 
+tokenator implements a minimal OAuth 2.0 authorization server (AS) and resource server (RS) for educational purposes.
+
+**Components:**
+- **Authorization Server (AS)** – Issues tokens via multiple OAuth 2.0 grants, manages identities
+- **Resource Server (RS)** – Validates tokens and serves protected resources
+
+**Key Concepts:**
+- **Scopes**: Coarse-grained permissions (e.g., `tickets.read`, `tickets.write`)
+- **Authorization Details**: Fine-grained permissions defined in [RAR RFC 9396](https://www.rfc-editor.org/rfc/rfc9396.html) (e.g., `orders:export`)
+- **On-Behalf-Of (OBO)**: Token exchange allowing a service to act on behalf of a user ([RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693))
+
 ```
-+----------------------+           +--------------------------+
-|  Authorization Server |  OBO JWT  |      Resource Server     |
-|  (cmd/as)             |---------> |      (cmd/rs)            |
-|                      |           |                          |
-| • /register/human    |           | • /accounts/{id}/orders/ |
-| • /register/agent    |           |   export                 |
-| • /oauth2/authorize  |           | • Validates JWT, perm,   |
-| • /oauth2/token      |           |   authorization_details  |
-| • /subject-assertion |           |                          |
-| • /admin/clients     |           |                          |
-+----------------------+           +--------------------------+
+┌──────────┐         ┌───────────────┐         ┌──────────────┐
+│  Client  │ OAuth   │     AS        │  Token  │      RS      │
+│  (App)   ├────────►│ Port 8080     ├────────►│  Port 9090   │
+└──────────┘         └───────────────┘         └──────────────┘
+                            │
+                            ▼
+                     ┌─────────────┐
+                     │  Identity   │
+                     │  Service    │
+                     └─────────────┘
 ```
 
-- **Authorization Server** – owns human and agent registrations, issues authorisation codes, access tokens, refresh tokens, subject assertions, and OBO tokens. All flows resolve identities from the in-memory identity store.
-- **Resource Server** – a tiny API that expects an OBO access token. It verifies the signature, audience, issuer, human subject, actor information, `perm` claim, and `authorization_details` payload.
-
-## Quickstart
-
-This section covers the essential flows for using the Authorization Server (AS) and Resource Server (RS) after they're running. For detailed setup instructions, see [Running locally](#running-locally) or [Running with Docker Compose](#running-with-docker-compose).
+## Usage Guide
 
 ### Prerequisites
 
-Before using the services, ensure you have:
-- Services running at `http://localhost:8080` (AS) and `http://localhost:9090` (RS)
-- `curl` and `jq` installed for testing
+Before using tokenator, ensure you have:
+- Go 1.24+ (for local development)
+- Docker and Docker Compose v2 (for containerized deployment)
+- `curl` and `jq` for testing
 
-**IMPORTANT:** You must seed OAuth clients before making any token requests:
+⚠️ **IMPORTANT:** You must seed OAuth clients before making any token requests:
 
 ```bash
 make seed
 ```
 
-This registers the demo clients (`agent-cli`, `human-web`) from the `clients/` directory into the SQLite database. Without this step, all token requests will fail with `invalid_client`. See [Seeding clients](#seeding-clients) for details.
+This registers demo clients (`agent-cli`, `human-web`) from the `clients/` directory into the SQLite database. Without this step, all token requests will fail with `invalid_client`. See [Seeding OAuth Clients](#seeding-oauth-clients) for details.
 
-### Core Workflows
+## OAuth Workflows
 
-#### 1. Client Credentials Grant (Machine-to-Machine)
+This section demonstrates the core OAuth 2.0 flows supported by tokenator. For automated testing, see [Test Scripts](#test-scripts).
+
+### 1. Client Credentials (Machine-to-Machine)
 
 Use this for service-to-service authentication without a user context.
 
@@ -96,7 +142,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 - `expires_in`: Token lifetime (default 3600s)
 - `token_type`: "Bearer"
 
-#### 2. Authorization Code Grant (User Context)
+### 2. Authorization Code with PKCE (User Auth)
 
 For web applications requiring user consent and identity.
 
@@ -151,14 +197,12 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'client_id=human-web' \
   -d "code_verifier=${CODE_VERIFIER}" \
   -d 'redirect_uri=http://localhost:5555/callback' | jq .
-```
-
 **Response includes:**
 - `access_token`: JWT with user identity (`sub`, `email`, `name`, `tenant_id`)
 - `refresh_token`: Long-lived token for obtaining new access tokens
 - `expires_in`: Access token lifetime
 
-#### 3. Refresh Token Grant
+### 3. Refresh Token Grant
 
 Exchange a refresh token for a new access token without user interaction.
 
@@ -172,7 +216,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 **Note:** Refresh token rotation is enabled. Each use generates a new refresh token and invalidates the old one. Reuse detection revokes the entire token family.
 
-#### 4. RFC 8693 Token Exchange (On-Behalf-Of)
+### 4. Token Exchange (On-Behalf-Of)
 
 Enable delegated access where an agent acts on behalf of a human with constrained permissions.
 
@@ -222,7 +266,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 The `perm` claim is a SHA-256 hash of the normalized `authorization_details`, enabling efficient permission verification.
 
-#### 5. Resource Server Access
+### 5. Resource Server Access
 
 Call protected endpoints with the OBO access token.
 
@@ -373,58 +417,70 @@ This project started as a lab. The following hardening has been added to help mo
 - HA/statelessness requires moving codes/refresh tokens to shared storage.
 - Metrics and structured audit logs are minimal; see `docs/PROD_READINESS_PLAN.md`.
 
-## Prerequisites
-
-- Go **1.24+**
-- `curl`
-- `sqlite3` (or set `AS_CLIENT_STORE=memory`)
-- Optional: Docker & Docker Compose v2
-- Optional: `make`
-
-## Running locally
+## Running Locally
 
 ```bash
 # Install dependencies
 go mod tidy
 
-# Start the authorisation server (AS)
+# Start the Authorization Server (AS)
 ISSUER=http://localhost:8080 \
 RS_AUDIENCE=http://localhost:9090 \
 go run ./cmd/as
 
-# In another terminal start the resource server (RS)
+# In another terminal, start the Resource Server (RS)
 RS_AUDIENCE=http://localhost:9090 \
 go run ./cmd/rs
 ```
 
 Both services expose `/healthz` endpoints. Configuration is driven via environment variables (see [Configuration](#configuration)).
 
-## Running with Docker Compose
+## Running with Docker
 
 ```bash
 docker compose up --build
 ```
 
 The compose file publishes:
+- Authorization Server: `http://localhost:8080`
+- Resource Server: `http://localhost:9090`
 
-- Authorisation server: `http://localhost:8080`
-- Resource server: `http://localhost:9090`
-
-Set additional environment variables by editing `docker-compose.yml` or creating a local `.env` file.
-
-## Identity Registration & End-to-End OAuth/OBO with Registered Identities
-
-Every OAuth/OBO flow relies on registered identities. The built-in APIs store data in an in-memory, thread-safe data store. Optionally protect the registration endpoints by setting `AS_ADMIN_TOKEN` (or `ADMIN_TOKEN`) and sending `X-Admin-Token` headers.
-
-### 1. Run the services
+To stop services:
 
 ```bash
-go run ./cmd/as
-# or
-docker compose up --build
+docker compose down
 ```
 
-### 2. Register identities
+Set additional environment variables by editing [docker-compose.yml](docker-compose.yml) or creating a `.env` file.
+
+## Seeding OAuth Clients
+
+Client registrations are stored in SQLite (`data/clients.db`) by default. Before making any OAuth requests, seed the demo clients:
+
+```bash
+make seed
+```
+
+Or manually:
+
+```bash
+AS_CLIENTS_DB=./data/clients.db ./scripts/seed_clients.sh
+```
+
+The seed script reads client configurations from `clients/*.json` and registers them. The demo client (`agent-cli`) has these credentials:
+- **Client ID:** `agent-cli`
+- **Client Secret:** `agent-cli-secret`
+- **Scopes:** `tickets.read`, `tickets.write`, `refunds.create`
+
+⚠️ **Without seeding clients first, all OAuth requests will fail with `invalid_client` errors.**
+
+## API Reference
+
+This section covers additional endpoints beyond the core OAuth workflows documented above.
+
+### Identity Registration
+
+Register human users and agent identities for use in OBO flows.
 
 ```bash
 # Create a human
@@ -441,11 +497,47 @@ curl -sS -X POST http://localhost:8080/register/agent \
 Optional administrative helpers:
 
 ```bash
+# List humans
 curl -sS http://localhost:8080/humans | jq .
+
+# List agents
 curl -sS http://localhost:8080/agents | jq .
 ```
 
-### Admin client registry
+**Security:** Protect these endpoints by setting `AS_ADMIN_TOKEN` and including `X-Admin-Token: <token>` header.
+
+### Seeding Identities
+
+Bootstrap demo identities by creating a JSON file and pointing `SEED_IDENTITIES_JSON` at it before starting the server:
+
+```json
+{
+  "humans": [
+    {
+      "email": "alice@example.com",
+      "name": "Alice Example",
+      "tenant_id": "default"
+    }
+  ],
+  "agents": [
+    {
+      "agent_id": "ingestor-42",
+      "name": "Data Ingestor",
+      "client_id": "agent-cli",
+      "capabilities": ["tickets.read", "tickets.write"],
+      "tenant_id": "default"
+    }
+  ]
+}
+```
+
+```bash
+SEED_IDENTITIES_JSON=./data/seed.json go run ./cmd/as
+```
+
+When using Docker Compose, mount the file and set the environment variable in `docker-compose.yml`.
+
+### Token Introspection
 
 Client registrations are managed via the admin API bound to `127.0.0.1` (default `127.0.0.1:8082`). Set `AS_ADMIN_TOKEN` and include `Authorization: Bearer <token>` when calling:
 
@@ -606,64 +698,85 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'scope=tickets.read' | jq .
 ```
 
-### Postman collection
+## Test Scripts
 
-Import the following collection and set the environment variables `BASE_URL`, `CLIENT_ID`, `CLIENT_SECRET`, `HUMAN_EMAIL`, `HUMAN_ID`, `AGENT_ID`, and `OBO_TOKEN`.
+tokenator includes comprehensive test scripts to validate all OAuth flows. These scripts automate the manual steps shown above and are ideal for CI/CD pipelines or local development.
 
-```json
-{
-  "info": {
-    "name": "tokenator Demo",
-    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
-  },
-  "item": [
-    {
-      "name": "Register human",
-      "request": {
-        "method": "POST",
-        "header": [{"key": "Content-Type", "value": "application/json"}],
-        "url": "{{BASE_URL}}/register/human",
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"email\": \"{{HUMAN_EMAIL}}\",\n  \"name\": \"Alice Example\",\n  \"tenant_id\": \"default\"\n}"
-        }
-      }
-    },
-    {
-      "name": "Register agent",
-      "request": {
-        "method": "POST",
-        "header": [{"key": "Content-Type", "value": "application/json"}],
-        "url": "{{BASE_URL}}/register/agent",
-        "body": {
-          "mode": "raw",
-          "raw": "{\n  \"agent_id\": \"{{AGENT_ID}}\",\n  \"name\": \"Data Ingestor\",\n  \"client_id\": \"{{CLIENT_ID}}\",\n  \"capabilities\": [\"tickets.read\", \"tickets.write\"],\n  \"tenant_id\": \"default\"\n}"
-        }
-      }
-    },
-    {
-      "name": "Token exchange",
-      "request": {
-        "method": "POST",
-        "header": [{"key": "Content-Type", "value": "application/x-www-form-urlencoded"}],
-        "url": "{{BASE_URL}}/oauth2/token",
-        "body": {
-          "mode": "urlencoded",
-          "urlencoded": [
-            {"key": "grant_type", "value": "urn:ietf:params:oauth:grant-type:token-exchange"},
-            {"key": "subject_token", "value": "{{OBO_TOKEN}}"},
-            {"key": "subject_token_type", "value": "urn:ietf:params:oauth:token-type:access_token"},
-            {"key": "audience", "value": "http://localhost:9090"},
-            {"key": "client_id", "value": "{{CLIENT_ID}}"},
-            {"key": "client_secret", "value": "{{CLIENT_SECRET}}"},
-            {"key": "authorization_details", "value": "[{\"type\":\"agent-action\",\"actions\":[\"tickets.export\"]}]"}
-          ]
-        }
-      }
-    }
-  ]
-}
+📖 **See [scripts/README.md](scripts/README.md) for complete documentation**, including:
+
+- End-to-end OBO flow automation
+- Individual grant type tests  
+- PKCE parameter generation
+- Token exchange workflows
+- Troubleshooting guide
+
+**Quick test:**
+
+```bash
+# Run complete OBO flow (non-interactive)
+./scripts/test_complete_obo_flow.sh
+
+# Test authorization code flow (opens browser)
+./scripts/test_auth_code_flow.sh
+
+# Test client credentials grant
+./scripts/test_client_credentials.sh
 ```
+
+All scripts require Docker services running and clients seeded (`make seed`).
+
+## Troubleshooting
+
+### Common Errors
+
+**`invalid_client` or `unknown client` error:**
+- Ensure clients are seeded: `make seed`
+- Verify client exists: `curl http://127.0.0.1:8082/admin/clients`
+- Check client_id spelling and credentials
+
+**`invalid_scope` or `scope not allowed` error:**
+- Requested scopes must match those configured for the client
+- Demo client scopes: `tickets.read`, `tickets.write`, `refunds.create`
+- Check client config: `curl http://127.0.0.1:8082/admin/clients/<client_id>`
+
+**PKCE validation fails:**
+- Code verifier must be 43-128 characters (RFC 7636)
+- Generate correctly: `openssl rand -base64 43 | tr -d '=+/' | head -c 43`
+- Ensure CODE_VERIFIER persists from authorization to token exchange
+
+**Token verification fails (`unknown kid` or signature error):**
+- AS and RS must use matching key ID (default: `dev-rs256`)
+- Check docker-compose.yml: `AS_SIGNING_KEY_ID=dev-rs256`
+- RS fetches JWKS from AS: verify AS is running on port 8080
+
+**`audience mismatch` error:**
+- Ensure RS_AUDIENCE matches between AS and RS
+- Default: `http://localhost:9090`
+- When using Docker, use `localhost` not internal hostnames
+
+**`permission denied` or `required permission not present`:**
+- Agent capabilities must match requested `authorization_details` actions
+- Example: Agent needs `orders:export` capability to request `actions:["orders:export"]`
+- Check agent registration: `curl http://localhost:8080/agents`
+
+**Authorization code redirect shows 404:**
+- This is expected behavior - no app is running on the redirect URI
+- Copy the `code` parameter from the URL bar manually
+
+**OBO token exchange fails (`invalid_request` or `unknown identity`):**
+- Ensure human identity is registered: `curl http://localhost:8080/humans`
+- Ensure agent identity is registered: `curl http://localhost:8080/agents`
+- Subject assertion email must match registered human
+- Agent's `client_id` must match OAuth client
+
+### Debugging Tips
+
+- **Decode JWTs:** Use [jwt.io](https://jwt.io) or `echo $TOKEN | jq -R 'split(".") | .[1] | @base64d | fromjson'`
+- **Check service logs:** Both AS and RS log detailed request/validation information
+- **Verify identity registration:** `curl http://localhost:8080/humans` and `curl http://localhost:8080/agents`
+- **Validate client config:** `curl http://127.0.0.1:8082/admin/clients/<client_id>`
+- **Test token validity:** Use `/oauth2/introspect` endpoint
+- **Enable verbose output:** Test scripts support DEBUG=1 environment variable
 
 ## Tests
 
@@ -706,18 +819,69 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 
 All configuration is logged at server startup (secrets are masked in logs).
 
-## Project layout
+## Project Structure
 
 ```
 cmd/
-  as/   # Authorisation server
-  rs/   # Demo resource server
+  as/           # Authorization Server
+  rs/           # Resource Server
+  seed-clients/ # Client seeding utility
 internal/
-  assertion/    # (legacy helper tooling)
+  admin/        # Client management
+  assertion/    # Subject assertion minting
   config/       # Environment-driven configuration
-  identity/     # Identity types, validation, and HTTP handlers
-  jwt/          # Minimal JWT signer/verification helpers
-  obo/          # Token exchange helpers
-  store/        # OAuth client/code/refresh stores and identity store implementations
-scripts/        # Automation helpers
+  http/         # HTTP utilities
+  identity/     # Identity types, validation, and handlers
+  jwt/          # JWT signing and verification
+  obo/          # Token exchange (OBO) logic
+  random/       # Secure random ID generation
+  ratelimit/    # Rate limiting
+  server/       # Server interfaces
+  store/        # Storage implementations (SQLite, memory)
+    mem/        # In-memory stores
+    sqlite/     # SQLite stores
+scripts/        # Test automation scripts
+clients/        # Demo OAuth client configurations
+data/           # Runtime data (databases, logs)
+docs/           # Production readiness documentation
 ```
+
+## Contributing
+
+Contributions are welcome! This project is designed for educational purposes, focusing on OAuth 2.0 and token exchange patterns.
+
+**How to contribute:**
+
+1. **Fork the repository** and create a feature branch
+2. **Make your changes** with clear commit messages
+3. **Add tests** for new functionality
+4. **Run the test suite:** `go test ./...`
+5. **Test manually** using the test scripts in `scripts/`
+6. **Submit a pull request** with a description of your changes
+
+**Areas for improvement:**
+
+- Additional OAuth grant types (device flow, SAML bearer)
+- OIDC support (ID tokens, UserInfo endpoint, discovery)
+- Production-ready storage backends (PostgreSQL, Redis)
+- Observability improvements (structured logging, metrics, tracing)
+- Additional test coverage
+- Documentation improvements
+
+**Guidelines:**
+
+- Follow Go conventions and idioms
+- Keep dependencies minimal
+- Maintain backward compatibility where possible
+- Document configuration changes in README
+- Update test scripts when adding new endpoints
+
+## License
+
+This project is licensed under the **MIT License**. See [LICENSE](LICENSE) for details.
+
+**Summary:** You are free to use, modify, and distribute this software for any purpose, including commercial applications, as long as the original license and copyright notice are included.
+
+---
+
+**tokenator** - An educational OAuth 2.0 server demonstrating authorization code flow, PKCE, refresh tokens, and RFC 8693 token exchange (OBO).
