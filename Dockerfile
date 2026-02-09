@@ -12,6 +12,7 @@ FROM alpine:latest
 RUN apk add --no-cache ca-certificates sqlite
 COPY --from=build /bin/as /bin/as
 COPY --from=build /bin/rs /bin/rs
+COPY --from=build /app/web /web
 EXPOSE 8080 9090
 USER 65532:65532
 CMD ["/bin/as"]

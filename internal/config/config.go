@@ -25,6 +25,7 @@ type Config struct {
 	OBOTokenTTL                time.Duration
 	AdminToken                 string
 	AllowLegacy                bool
+	DevMode                    bool
 	SeedIdentitiesPath         string
 	ClientDBPath               string
 	ClientStoreDriver          string
@@ -145,6 +146,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.AllowLegacy = allowLegacy
+
+	devMode, err := parseBool("DEV_MODE", false)
+	if err != nil {
+		return nil, err
+	}
+	cfg.DevMode = devMode
 
 	authorizeRPS, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_RPS", defaultAuthorizeRPS)
 	if err != nil {

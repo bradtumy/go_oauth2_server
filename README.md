@@ -7,11 +7,13 @@ An educational OAuth 2.0 authorization server and companion resource server writ
 
 ## Features
 
+- ✅ **User Authentication**: Login/logout with password-based authentication and session management
+- ✅ **OAuth Consent Flow**: User consent pages showing requested permissions before authorization
 - ✅ **Standard OAuth 2.0 Grants**: Authorization code with PKCE, client credentials, refresh token
 - ✅ **RFC 8693 Token Exchange**: On-behalf-of (OBO) delegation for agent-on-human scenarios
 - ✅ **Rich Authorization Requests**: Fine-grained permissions with `authorization_details`
 - ✅ **Identity Management**: Built-in APIs for human and agent identity registration
-- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting
+- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting, bcrypt password hashing
 - ✅ **JWT Tokens**: Self-contained JWTs with RSA signatures and JWKS endpoint
 - ✅ **Admin API**: Dynamic client registration and management
 - ✅ **Test Scripts**: Automated end-to-end test suite in `/scripts`
@@ -144,9 +146,9 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 ### 2. Authorization Code with PKCE (User Auth)
 
-For web applications requiring user consent and identity.
+Requires **user authentication** via login page and consent before issuing tokens. This is the standard OAuth 2.0 flow for web and mobile applications.
 
-**Step 1:** Register a human identity
+**Step 1:** Register a human identity with a password
 
 ```bash
 curl -sS -X POST http://localhost:8080/register/human \
@@ -154,6 +156,7 @@ curl -sS -X POST http://localhost:8080/register/human \
   -d '{
     "email": "alice@example.com",
     "name": "Alice Example",
+    "password": "SecurePassword123",
     "tenant_id": "default"
   }' | jq .
 ```
@@ -172,7 +175,7 @@ echo "Verifier: ${CODE_VERIFIER}"
 echo "Challenge: ${CODE_CHALLENGE}"
 ```
 
-**Step 3:** Initiate authorization (opens browser)
+**Step 3:** Initiate authorization (opens browser to login page)
 
 ```bash
 open "http://localhost:8080/oauth2/authorize?\
@@ -180,12 +183,23 @@ response_type=code&\
 client_id=human-web&\
 redirect_uri=http://localhost:5555/callback&\
 scope=tickets.read&\
-email=alice@example.com&\
 code_challenge=${CODE_CHALLENGE}&\
 code_challenge_method=S256"
 ```
 
-The browser will redirect to `http://localhost:5555/callback?code=...` (which will show a 404 - this is expected since no app is running there). Copy the `code` parameter from the URL.
+**What happens:**
+1. Browser redirects to `/login` page (authentication required)
+2. User enters email (`alice@example.com`) and password (`SecurePassword123`)
+3. After successful login, consent page shows requested permissions
+4. User clicks "Authorize" to approve the request
+5. Browser redirects to `http://localhost:5555/callback?code=...` with authorization code
+
+> **Note:** If no callback server is running on port 5555, you'll see a connection error. This is expected - simply copy the `code` parameter from the URL bar.
+
+**Alternative:** Use the automated test script to see the complete flow:
+```bash
+./scripts/test_auth_flow.sh
+```
 
 **Step 4:** Exchange the authorization code for tokens
 
@@ -399,6 +413,81 @@ curl -sS http://localhost:9090/healthz
   - `401 unauthorized`: Invalid client credentials
   - `403 forbidden`: Agent lacks required capabilities for requested actions
   - `429 too_many_requests`: Rate limit exceeded
+
+## Authentication
+
+tokenator implements secure user authentication with login/logout, password management, and session-based security for the OAuth authorization code grant flow.
+
+### User Registration with Passwords
+
+Register users with secure password hashing (bcrypt, cost factor 12):
+
+```bash
+curl -X POST http://localhost:8080/register/human \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "user@example.com",
+    "name": "User Name",
+    "password": "SecurePassword123",
+    "tenant_id": "default"
+  }'
+```
+
+> **Note:** The `password` field is optional. Users without passwords can only login in `DEV_MODE=true`.
+
+### Login Flow
+
+When users access `/oauth2/authorize`, they are redirected to `/login` if not authenticated:
+
+1. **Login Page** - Users enter email and password
+2. **Authentication** - Credentials verified against bcrypt hash
+3. **Session Creation** - HTTP-only session cookie issued (8 hour max, 30 min idle timeout)
+4. **Consent Page** - User sees requested scopes and approves/denies
+5. **Authorization Code** - Issued only after consent approval
+
+### Session Management
+
+- **Session Storage**: In-memory (production should use Redis/database)
+- **Session Cookie**: HTTP-only, SameSite=Lax, 8-hour absolute timeout, 30-minute idle timeout
+- **CSRF Protection**: CSRF tokens generated per session
+- **Automatic Cleanup**: Background worker removes expired sessions every 15 minutes
+
+### Development Mode
+
+Enable `DEV_MODE=true` to allow passwordless login for testing:
+
+```bash
+DEV_MODE=true go run ./cmd/as
+```
+
+In dev mode, users can login with just their email if no password is set. The login page displays a visual indicator when dev mode is active.
+
+### Logout
+
+End a user session:
+
+```bash
+# Programmatically
+curl -X POST http://localhost:8080/logout \
+  -H 'Cookie: session_id=<SESSION_ID>'
+
+# Or visit in browser
+open http://localhost:8080/logout
+```
+
+Logout clears the session cookie and removes the session from the store.
+
+### Security Considerations
+
+- ✅ Passwords hashed with bcrypt (cost factor 12, industry standard)
+- ✅ Minimum password length: 8 characters
+- ✅ HTTP-only cookies prevent XSS attacks
+- ✅ SameSite=Lax prevents CSRF attacks
+- ✅ Session expiration enforced (idle and absolute timeouts)
+- ⚠️ In-memory session storage (use Redis/database for production)
+- ⚠️ No rate limiting on login endpoint (add for production)
+- ⚠️ No account lockout after failed attempts (add for production)
+- ⚠️ No password reset flow (add for production)
 
 ## Production Readiness
 
@@ -708,16 +797,21 @@ tokenator includes comprehensive test scripts to validate all OAuth flows. These
 - Individual grant type tests  
 - PKCE parameter generation
 - Token exchange workflows
+- **Authentication flow testing**
 - Troubleshooting guide
 
-**Quick test:**
+**Quick tests:**
 
 ```bash
+# Test complete authentication flow (login → consent → token exchange)
+./scripts/test_auth_flow.sh
+
 # Run complete OBO flow (non-interactive)
 ./scripts/test_complete_obo_flow.sh
 
 # Test authorization code flow (opens browser)
 ./scripts/test_auth_code_flow.sh
+```
 
 # Test client credentials grant
 ./scripts/test_client_credentials.sh
@@ -792,6 +886,7 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 | ---------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------- |
 | `ISSUER`                           | Issuer used in all minted tokens                                                             | `http://localhost:8080`         |
 | `RS_AUDIENCE`                      | Audience for access and OBO tokens                                                           | `http://localhost:9090`         |
+| `DEV_MODE`                         | Enable development mode (allows passwordless login for users without passwords)              | `false`                         |
 | `AS_ADMIN_TOKEN`                   | Shared secret that gates `/register/*` (`X-Admin-Token`) and `/admin/*` (`Authorization: Bearer`) endpoints | unset          |
 | `ADMIN_TOKEN`                      | Legacy alias for `AS_ADMIN_TOKEN`                                                            | unset                           |
 | `ALLOW_LEGACY_HARDCODED`           | Set to `true` to allow legacy hard-coded users/agents (development only)                    | `false`                         |

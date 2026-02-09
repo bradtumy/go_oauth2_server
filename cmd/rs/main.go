@@ -55,18 +55,33 @@ func main() {
 			return
 		}
 		account := parts[0]
-		claims, err := validateRequest(r, signer, cfg.Audience, account)
+		claims, authResult, err := validateRequest(r, signer, cfg.Audience, account)
 		if err != nil {
-			writeJSONStatus(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			// Include authorization result in error response if available
+			if authResult != nil {
+				writeJSONStatus(w, http.StatusForbidden, map[string]any{
+					"error":         err.Error(),
+					"authorization": authResult,
+				})
+			} else {
+				writeJSONStatus(w, http.StatusForbidden, map[string]any{"error": err.Error()})
+			}
 			return
 		}
+		// For direct user tokens, the subject is the actor
+		// For delegated tokens (OBO), act.actor contains the original actor
 		actor := nestedString(claims, "act", "actor")
 		subject, _ := claims["sub"].(string)
+		if actor == "" {
+			// No delegation - user is acting as themselves
+			actor = subject
+		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":   "ok",
-			"actor":    actor,
-			"subject":  subject,
-			"resource": account,
+			"status":        "ok",
+			"actor":         actor,
+			"subject":       subject,
+			"resource":      account,
+			"authorization": authResult,
 		})
 	})
 
@@ -111,58 +126,95 @@ func loadConfig() (*resourceConfig, error) {
 	}, nil
 }
 
-func validateRequest(r *http.Request, signer *internaljwt.Signer, audience, acctID string) (map[string]any, error) {
+func validateRequest(r *http.Request, signer *internaljwt.Signer, audience, acctID string) (map[string]any, *AuthorizationResult, error) {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {
-		return nil, errors.New("missing authorization header")
+		return nil, nil, errors.New("missing authorization header")
 	}
 	parts := strings.SplitN(auth, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "bearer") {
-		return nil, errors.New("invalid authorization header")
+		return nil, nil, errors.New("invalid authorization header")
 	}
 	token := strings.TrimSpace(parts[1])
 	claimsRaw, err := signer.Verify(token, audience)
 	if err != nil {
-		return nil, fmt.Errorf("token verification failed: %w", err)
+		return nil, nil, fmt.Errorf("token verification failed: %w", err)
 	}
 	sub, ok := claimsRaw["sub"].(string)
 	if !ok || sub == "" {
-		return nil, errors.New("missing sub claim")
+		return nil, nil, errors.New("missing sub claim")
 	}
+	// For direct user tokens, the subject is the actor
+	// For delegated tokens (OBO), act.actor contains the original actor
 	actor := nestedString(claimsRaw, "act", "actor")
 	if actor == "" {
-		return nil, errors.New("missing act.actor claim")
+		// No delegation - user is acting as themselves
+		actor = sub
 	}
-	if err := authorize(acctID, claimsRaw); err != nil {
-		return nil, err
+	authResult, err := authorize(acctID, claimsRaw)
+	if err != nil {
+		return nil, authResult, err
 	}
-	return claimsRaw, nil
+	return claimsRaw, authResult, nil
 }
 
-func authorize(acctID string, claims map[string]any) error {
+type AuthorizationResult struct {
+	Allowed       bool
+	MatchedScope  string
+	TokenScopes   []string
+	RequiredScope string
+	Policy        string
+	Reason        string
+}
+
+func authorize(acctID string, claims map[string]any) (*AuthorizationResult, error) {
 	if acctID == "" {
-		return errors.New("missing account identifier")
+		return nil, errors.New("missing account identifier")
 	}
-	expectedPerm := "orders:export:" + acctID
-	switch perms := claims["perm"].(type) {
-	case []any:
-		for _, p := range perms {
-			if ps, ok := p.(string); ok && ps == expectedPerm {
-				if containsResource(claims, acctID) {
-					return nil
-				}
-			}
-		}
-	case []string:
-		for _, ps := range perms {
-			if ps == expectedPerm {
-				if containsResource(claims, acctID) {
-					return nil
-				}
-			}
-		}
+
+	// Pure OAuth 2.0: Check if the token has required scopes
+	scope, ok := claims["scope"].(string)
+	if !ok || scope == "" {
+		return nil, errors.New("missing scope claim")
 	}
-	return errors.New("required permission not present")
+
+	// Parse space-separated scopes
+	scopes := strings.Fields(scope)
+	scopeSet := make(map[string]bool)
+	for _, s := range scopes {
+		scopeSet[s] = true
+	}
+
+	result := &AuthorizationResult{
+		TokenScopes:   scopes,
+		RequiredScope: "tickets.read OR orders.read OR orders.write",
+		Policy:        "orders_export_policy",
+	}
+
+	// Check if token has any of the acceptable scopes for this resource
+	// For the /accounts/{id}/orders/export endpoint:
+	if scopeSet["tickets.read"] {
+		result.Allowed = true
+		result.MatchedScope = "tickets.read"
+		result.Reason = "Token contains 'tickets.read' scope which grants read access to order export resources"
+		return result, nil
+	}
+	if scopeSet["orders.read"] {
+		result.Allowed = true
+		result.MatchedScope = "orders.read"
+		result.Reason = "Token contains 'orders.read' scope which grants read access to order resources"
+		return result, nil
+	}
+	if scopeSet["orders.write"] {
+		result.Allowed = true
+		result.MatchedScope = "orders.write"
+		result.Reason = "Token contains 'orders.write' scope which grants full access to order resources"
+		return result, nil
+	}
+
+	result.Allowed = false
+	result.Reason = fmt.Sprintf("Token scopes %v do not match required scopes for this resource", scopes)
+	return result, errors.New("insufficient scope")
 }
 
 func containsResource(claims map[string]any, acctID string) bool {

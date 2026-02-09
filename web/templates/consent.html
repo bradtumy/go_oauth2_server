@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authorize - Tokenator</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .consent-container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            width: 100%;
+            max-width: 520px;
+            padding: 40px;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+        
+        .header h1 {
+            color: #1f2937;
+            font-size: 24px;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            color: #6b7280;
+            font-size: 14px;
+        }
+        
+        .client-info {
+            background: #f9fafb;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 24px;
+        }
+        
+        .client-name {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1f2937;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+        }
+        
+        .client-name::before {
+            content: '🔑';
+            margin-right: 10px;
+            font-size: 24px;
+        }
+        
+        .client-description {
+            color: #6b7280;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .user-info {
+            background: #eff6ff;
+            border: 1px solid #bfdbfe;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 24px;
+            font-size: 14px;
+            color: #1e40af;
+        }
+        
+        .user-info strong {
+            font-weight: 600;
+        }
+        
+        .permissions-section {
+            margin-bottom: 24px;
+        }
+        
+        .permissions-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1f2937;
+            margin-bottom: 16px;
+        }
+        
+        .permission-item {
+            display: flex;
+            align-items: flex-start;
+            padding: 12px;
+            background: #f9fafb;
+            border-radius: 8px;
+            margin-bottom: 8px;
+        }
+        
+        .permission-icon {
+            flex-shrink: 0;
+            width: 24px;
+            height: 24px;
+            background: #667eea;
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-size: 12px;
+        }
+        
+        .permission-text {
+            flex: 1;
+        }
+        
+        .permission-name {
+            font-weight: 600;
+            color: #1f2937;
+            font-size: 14px;
+            margin-bottom: 4px;
+        }
+        
+        .permission-description {
+            color: #6b7280;
+            font-size: 13px;
+            line-height: 1.4;
+        }
+        
+        .warning-box {
+            background: #fef3c7;
+            border: 1px solid #fbbf24;
+            border-radius: 8px;
+            padding: 12px 16px;
+            margin-bottom: 24px;
+            font-size: 13px;
+            color: #78350f;
+        }
+        
+        .warning-box strong {
+            display: block;
+            margin-bottom: 4px;
+        }
+        
+        .button-group {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .btn {
+            flex: 1;
+            padding: 14px 24px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        
+        .btn-approve {
+            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+            color: white;
+        }
+        
+        .btn-approve:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(16, 185, 129, 0.4);
+        }
+        
+        .btn-deny {
+            background: #f3f4f6;
+            color: #6b7280;
+            border: 2px solid #e5e7eb;
+        }
+        
+        .btn-deny:hover {
+            background: #e5e7eb;
+            color: #374151;
+        }
+        
+        .btn:active {
+            transform: translateY(0);
+        }
+        
+        .footer-links {
+            text-align: center;
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid #e5e7eb;
+        }
+        
+        .footer-links a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 13px;
+            margin: 0 12px;
+        }
+        
+        .footer-links a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="consent-container">
+        <div class="header">
+            <h1>Authorization Request</h1>
+            <p>An application is requesting access to your account</p>
+        </div>
+        
+        <div class="client-info">
+            <div class="client-name">{{.ClientName}}</div>
+            <div class="client-description">
+                This application will be able to access your data as described below.
+            </div>
+        </div>
+        
+        <div class="user-info">
+            Signing in as: <strong>{{.UserEmail}}</strong>
+            <a href="/logout" style="float: right; color: #667eea; text-decoration: none;">Switch account</a>
+        </div>
+        
+        <div class="permissions-section">
+            <div class="permissions-title">This application will be able to:</div>
+            
+            {{range .Permissions}}
+            <div class="permission-item">
+                <div class="permission-icon">✓</div>
+                <div class="permission-text">
+                    <div class="permission-name">{{.Name}}</div>
+                    <div class="permission-description">{{.Description}}</div>
+                </div>
+            </div>
+            {{end}}
+        </div>
+        
+        <div class="warning-box">
+            <strong>⚠️ Security Notice</strong>
+            Only authorize applications you trust. This application will be able to access your data even when you're not using it.
+        </div>
+        
+        <form method="POST" action="/consent">
+            <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+            <input type="hidden" name="client_id" value="{{.ClientID}}">
+            <input type="hidden" name="redirect_uri" value="{{.RedirectURI}}">
+            <input type="hidden" name="scope" value="{{.Scope}}">
+            <input type="hidden" name="state" value="{{.State}}">
+            <input type="hidden" name="code_challenge" value="{{.CodeChallenge}}">
+            <input type="hidden" name="code_challenge_method" value="{{.CodeChallengeMethod}}">
+            
+            <div class="button-group">
+                <button type="submit" name="action" value="approve" class="btn btn-approve">
+                    Authorize
+                </button>
+                <button type="submit" name="action" value="deny" class="btn btn-deny">
+                    Cancel
+                </button>
+            </div>
+        </form>
+        
+        <div class="footer-links">
+            <a href="/privacy">Privacy Policy</a>
+            <a href="/terms">Terms of Service</a>
+            <a href="/help">Help</a>
+        </div>
+    </div>
+</body>
+</html>
