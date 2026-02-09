@@ -18,13 +18,13 @@ import (
 	"testing"
 	"time"
 
-	"go_oauth2_server/internal/config"
-	"go_oauth2_server/internal/identity"
-	internaljwt "go_oauth2_server/internal/jwt"
-	"go_oauth2_server/internal/obo"
-	"go_oauth2_server/internal/ratelimit"
-	"go_oauth2_server/internal/store"
-	memstore "go_oauth2_server/internal/store/mem"
+	"tokenator/internal/config"
+	"tokenator/internal/identity"
+	internaljwt "tokenator/internal/jwt"
+	"tokenator/internal/obo"
+	"tokenator/internal/ratelimit"
+	"tokenator/internal/store"
+	memstore "tokenator/internal/store/mem"
 )
 
 const testSigningKeyPEM = `-----BEGIN PRIVATE KEY-----

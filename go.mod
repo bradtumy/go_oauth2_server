@@ -1,3 +1,3 @@
-module go_oauth2_server
+module tokenator
 
 go 1.24

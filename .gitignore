@@ -1,1 +1,15 @@
 server
+# Local data and databases (may contain sensitive information)
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# Environment files with secrets
+.env
+.env.local
+.env.*.local
+
+# Test outputs and temporary files
+*.log
+.DS_Store

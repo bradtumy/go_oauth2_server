@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"go_oauth2_server/internal/store"
+	"tokenator/internal/store"
 )
 
 // Config represents runtime configuration for the authorization server.

@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 
-	"go_oauth2_server/internal/store"
-	sqlstore "go_oauth2_server/internal/store/sqlite"
+	"tokenator/internal/store"
+	sqlstore "tokenator/internal/store/sqlite"
 )
 
 func main() {

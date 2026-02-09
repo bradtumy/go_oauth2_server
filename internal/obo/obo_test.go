@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	internaljwt "go_oauth2_server/internal/jwt"
+	internaljwt "tokenator/internal/jwt"
 )
 
 const testSigningKeyPEM = `-----BEGIN PRIVATE KEY-----

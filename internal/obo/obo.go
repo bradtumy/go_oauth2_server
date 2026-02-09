@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	internaljwt "go_oauth2_server/internal/jwt"
+	internaljwt "tokenator/internal/jwt"
 )
 
 // RAR represents a Rich Authorization Request entry.

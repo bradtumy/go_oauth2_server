@@ -18,16 +18,16 @@ import (
 	"strings"
 	"time"
 
-	"go_oauth2_server/internal/admin"
-	"go_oauth2_server/internal/config"
-	"go_oauth2_server/internal/identity"
-	internaljwt "go_oauth2_server/internal/jwt"
-	"go_oauth2_server/internal/obo"
-	"go_oauth2_server/internal/random"
-	"go_oauth2_server/internal/ratelimit"
-	"go_oauth2_server/internal/store"
-	memstore "go_oauth2_server/internal/store/mem"
-	sqlstore "go_oauth2_server/internal/store/sqlite"
+	"tokenator/internal/admin"
+	"tokenator/internal/config"
+	"tokenator/internal/identity"
+	internaljwt "tokenator/internal/jwt"
+	"tokenator/internal/obo"
+	"tokenator/internal/random"
+	"tokenator/internal/ratelimit"
+	"tokenator/internal/store"
+	memstore "tokenator/internal/store/mem"
+	sqlstore "tokenator/internal/store/sqlite"
 )
 
 func main() {

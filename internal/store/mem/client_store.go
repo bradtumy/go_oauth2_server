@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"go_oauth2_server/internal/store"
+	"tokenator/internal/store"
 )
 
 type ClientStore struct {

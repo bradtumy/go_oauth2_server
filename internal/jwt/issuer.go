@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"go_oauth2_server/internal/random"
+	"tokenator/internal/random"
 )
 
 // MapClaims represents JWT claims as a map.

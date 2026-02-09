@@ -1,4 +1,4 @@
-# go_oauth2_server
+# tokenator
 
 An educational OAuth 2.0 authorisation server and companion resource server written in Go. The service supports:
 
@@ -12,6 +12,16 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 ## Contents
 
 - [Architecture](#architecture)
+- [Quickstart](#quickstart)
+  - [Prerequisites](#prerequisites)
+  - [Core Workflows](#core-workflows)
+  - [Token Introspection](#token-introspection)
+  - [Token Revocation](#token-revocation)
+  - [Admin API Operations](#admin-api-operations)
+  - [JWKS Endpoint](#jwks-endpoint)
+  - [Health Checks](#health-checks)
+  - [Common Patterns](#common-patterns)
+  - [Debugging Tips](#debugging-tips)
 - [Production Readiness](#production-readiness)
 - [Prerequisites](#prerequisites)
 - [Running locally](#running-locally)
@@ -47,6 +57,304 @@ The project is intended for local development and demo scenarios. Tokens are JSO
 
 - **Authorization Server** – owns human and agent registrations, issues authorisation codes, access tokens, refresh tokens, subject assertions, and OBO tokens. All flows resolve identities from the in-memory identity store.
 - **Resource Server** – a tiny API that expects an OBO access token. It verifies the signature, audience, issuer, human subject, actor information, `perm` claim, and `authorization_details` payload.
+
+## Quickstart
+
+This section covers the essential flows for using the Authorization Server (AS) and Resource Server (RS) after they're running. For detailed setup instructions, see [Running locally](#running-locally) or [Running with Docker Compose](#running-with-docker-compose).
+
+### Prerequisites
+
+Before using the services, ensure you have:
+- Services running at `http://localhost:8080` (AS) and `http://localhost:9090` (RS)
+- `curl` and `jq` installed for testing
+
+**IMPORTANT:** You must seed OAuth clients before making any token requests:
+
+```bash
+make seed
+```
+
+This registers the demo clients (`agent-cli`, `human-web`) from the `clients/` directory into the SQLite database. Without this step, all token requests will fail with `invalid_client`. See [Seeding clients](#seeding-clients) for details.
+
+### Core Workflows
+
+#### 1. Client Credentials Grant (Machine-to-Machine)
+
+Use this for service-to-service authentication without a user context.
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials' \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret' \
+  -d 'scope=tickets.read' | jq .
+```
+
+**Response includes:**
+- `access_token`: JWT containing client identity and scopes
+- `expires_in`: Token lifetime (default 3600s)
+- `token_type`: "Bearer"
+
+#### 2. Authorization Code Grant (User Context)
+
+For web applications requiring user consent and identity.
+
+**Step 1:** Register a human identity
+
+```bash
+curl -sS -X POST http://localhost:8080/register/human \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "email": "alice@example.com",
+    "name": "Alice Example",
+    "tenant_id": "default"
+  }' | jq .
+```
+
+**Step 2:** Generate PKCE parameters (required for public clients)
+
+> **Important:** Run Steps 2-4 in the same terminal session. The `CODE_VERIFIER` environment variable must persist from Step 2 through Step 4.
+
+```bash
+CODE_VERIFIER=$(openssl rand -base64 43 | tr -d '=+/' | head -c 43)
+CODE_CHALLENGE=$(printf '%s' "${CODE_VERIFIER}" | openssl dgst -sha256 -binary | \
+  openssl base64 -A | tr '+/' '-_' | tr -d '=')
+
+# Verify they're set (should output random strings)
+echo "Verifier: ${CODE_VERIFIER}"
+echo "Challenge: ${CODE_CHALLENGE}"
+```
+
+**Step 3:** Initiate authorization (opens browser)
+
+```bash
+open "http://localhost:8080/oauth2/authorize?\
+response_type=code&\
+client_id=human-web&\
+redirect_uri=http://localhost:5555/callback&\
+scope=tickets.read&\
+email=alice@example.com&\
+code_challenge=${CODE_CHALLENGE}&\
+code_challenge_method=S256"
+```
+
+The browser will redirect to `http://localhost:5555/callback?code=...` (which will show a 404 - this is expected since no app is running there). Copy the `code` parameter from the URL.
+
+**Step 4:** Exchange the authorization code for tokens
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=authorization_code' \
+  -d "code=<AUTHORIZATION_CODE>" \
+  -d 'client_id=human-web' \
+  -d "code_verifier=${CODE_VERIFIER}" \
+  -d 'redirect_uri=http://localhost:5555/callback' | jq .
+```
+
+**Response includes:**
+- `access_token`: JWT with user identity (`sub`, `email`, `name`, `tenant_id`)
+- `refresh_token`: Long-lived token for obtaining new access tokens
+- `expires_in`: Access token lifetime
+
+#### 3. Refresh Token Grant
+
+Exchange a refresh token for a new access token without user interaction.
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=refresh_token' \
+  -d "refresh_token=<REFRESH_TOKEN>" \
+  -d 'client_id=human-web' | jq .
+```
+
+**Note:** Refresh token rotation is enabled. Each use generates a new refresh token and invalidates the old one. Reuse detection revokes the entire token family.
+
+#### 4. RFC 8693 Token Exchange (On-Behalf-Of)
+
+Enable delegated access where an agent acts on behalf of a human with constrained permissions.
+
+**Step 1:** Register an agent identity
+
+```bash
+curl -sS -X POST http://localhost:8080/register/agent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "agent_id": "ingestor-42",
+    "name": "Data Ingestor",
+    "client_id": "agent-cli",
+    "capabilities": ["tickets.read", "tickets.write"],
+    "tenant_id": "default"
+  }' | jq .
+```
+
+**Step 2:** Mint a subject assertion for the human
+
+```bash
+SUBJECT_ASSERTION=$(curl -sS -X POST http://localhost:8080/subject-assertion \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com"}' | jq -r .assertion)
+```
+
+**Step 3:** Perform token exchange with authorization details
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=urn:ietf:params:oauth:grant-type:token-exchange' \
+  -d "subject_token=${SUBJECT_ASSERTION}" \
+  -d 'subject_token_type=urn:ietf:params:oauth:token-type:access_token' \
+  -d 'audience=http://localhost:9090' \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret' \
+  --data-urlencode 'authorization_details=[{
+    "type": "agent-action",
+    "actions": ["tickets.export"],
+    "constraints": {"resource_ids": ["acct:abc"]}
+  }]' | jq .
+```
+
+**Response includes:**
+- `access_token`: OBO JWT with `sub` (human), `act.actor` (agent), `perm` hash, and `authorization_details`
+- `issued_token_type`: `urn:ietf:params:oauth:token-type:access_token`
+
+The `perm` claim is a SHA-256 hash of the normalized `authorization_details`, enabling efficient permission verification.
+
+#### 5. Resource Server Access
+
+Call protected endpoints with the OBO access token.
+
+```bash
+curl -sS -H "Authorization: Bearer <OBO_ACCESS_TOKEN>" \
+  http://localhost:9090/accounts/acct:abc/orders/export | jq .
+```
+
+**The RS validates:**
+- JWT signature and standard claims (exp, iss, aud)
+- Human subject (`sub`)
+- Agent actor (`act.actor` matches registered agent)
+- Permission hash (`perm` matches authorization_details)
+- Resource constraints (e.g., `resource_ids` contains requested account)
+
+### Token Introspection
+
+Check token validity and metadata.
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/introspect \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d "token=<ACCESS_OR_REFRESH_TOKEN>" \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret' | jq .
+```
+
+### Token Revocation
+
+Revoke refresh tokens (access token revocation not supported for self-contained JWTs).
+
+```bash
+curl -sS -X POST http://localhost:8080/oauth2/revoke \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d "token=<REFRESH_TOKEN>" \
+  -d 'client_id=agent-cli' \
+  -d 'client_secret=agent-cli-secret'
+```
+
+### Admin API Operations
+
+Manage OAuth clients via the admin API (bound to `127.0.0.1:8082` by default). Set `AS_ADMIN_TOKEN` to require authentication.
+
+```bash
+# List all clients
+curl -sS http://127.0.0.1:8082/admin/clients | jq .
+
+# Create a new client
+curl -sS -X POST http://127.0.0.1:8082/admin/clients \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "my-app",
+    "client_secret": "supersecret",
+    "name": "My Application",
+    "client_type": "confidential",
+    "grant_types": ["authorization_code", "refresh_token"],
+    "redirect_uris": ["https://myapp.com/callback"],
+    "scopes": ["profile", "email"]
+  }' | jq .
+
+# Get client details
+curl -sS http://127.0.0.1:8082/admin/clients/my-app | jq .
+
+# Update a client
+curl -sS -X PUT http://127.0.0.1:8082/admin/clients/my-app \
+  -H "Content-Type: application/json" \
+  -d '{
+    "client_id": "my-app",
+    "client_secret": "newsecret",
+    "name": "My Updated App",
+    "client_type": "confidential",
+    "grant_types": ["authorization_code", "refresh_token", "client_credentials"],
+    "redirect_uris": ["https://myapp.com/callback"],
+    "scopes": ["profile", "email", "tickets.read"]
+  }' | jq .
+
+# Delete a client
+curl -sS -X DELETE http://127.0.0.1:8082/admin/clients/my-app
+```
+
+### JWKS Endpoint
+
+Retrieve public keys for JWT verification (used by RS and external services).
+
+```bash
+curl -sS http://localhost:8080/.well-known/jwks.json | jq .
+```
+
+### Health Checks
+
+Verify service availability.
+
+```bash
+# Authorization Server
+curl -sS http://localhost:8080/healthz
+
+# Resource Server
+curl -sS http://localhost:9090/healthz
+```
+
+### Common Patterns
+
+**Pattern 1: Machine acting on behalf of user**
+1. User obtains access token via authorization code grant
+2. User's access token used as `subject_token` in token exchange
+3. Machine client receives OBO token with constrained permissions
+4. Machine uses OBO token to access RS on user's behalf
+
+**Pattern 2: Scheduled job acting on behalf of user**
+1. Mint subject assertion for user (requires user email/ID)
+2. Exchange assertion for OBO token with specific `authorization_details`
+3. Job uses OBO token to perform authorized actions
+4. Token expires after short TTL (default 15min)
+
+**Pattern 3: Long-lived background service**
+1. Use refresh token grant to maintain user session
+2. Monitor token expiration and refresh proactively
+3. Handle refresh token rotation (store new tokens)
+4. Implement reuse detection handling (re-authenticate if family revoked)
+
+### Debugging Tips
+
+- **Decode JWTs:** Use [jwt.io](https://jwt.io) or `jq -R 'split(".") | .[1] | @base64d | fromjson'`
+- **Check logs:** Both AS and RS log detailed request/validation information
+- **Verify identity registration:** `curl http://localhost:8080/humans` and `curl http://localhost:8080/agents`
+- **Validate client config:** `curl http://127.0.0.1:8082/admin/clients/<client_id>`
+- **Test token validity:** Use `/oauth2/introspect` endpoint
+- **Common errors:**
+  - `400 invalid_request`: Missing required parameters or unknown identity
+  - `401 unauthorized`: Invalid client credentials
+  - `403 forbidden`: Agent lacks required capabilities for requested actions
+  - `429 too_many_requests`: Rate limit exceeded
 
 ## Production Readiness
 
@@ -127,7 +435,7 @@ curl -sS -X POST http://localhost:8080/register/human \
 # Create an agent (client_id must match your OAuth client)
 curl -sS -X POST http://localhost:8080/register/agent \
   -H 'Content-Type: application/json' \
-  -d '{"agent_id":"ingestor-42","name":"Data Ingestor","client_id":"agent-cli","capabilities":["orders:read","orders:export"],"tenant_id":"default"}' | jq .
+  -d '{"agent_id":"ingestor-42","name":"Data Ingestor","client_id":"agent-cli","capabilities":["tickets.read","tickets.write"],"tenant_id":"default"}' | jq .
 ```
 
 Optional administrative helpers:
@@ -223,7 +531,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'audience=http://localhost:9090' \
   -d 'client_id=agent-cli' \
   -d 'client_secret=agent-cli-secret' \
-  --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
+  --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["tickets.export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
 ```
 
 - The server supports token exchange (RFC 8693), so you can use the above request to trade a subject token for an on-behalf-of access token.
@@ -262,7 +570,7 @@ Bootstrap demo data by creating a JSON file and pointing `SEED_IDENTITIES_JSON` 
       "agent_id": "ingestor-42",
       "name": "Data Ingestor",
       "client_id": "agent-cli",
-      "capabilities": ["orders:read", "orders:export"],
+      "capabilities": ["tickets.read", "tickets.write"],
       "tenant_id": "default"
     }
   ]
@@ -295,7 +603,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'grant_type=client_credentials' \
   -d 'client_id=agent-cli' \
   -d 'client_secret=agent-cli-secret' \
-  -d 'scope=orders:read' | jq .
+  -d 'scope=tickets.read' | jq .
 ```
 
 ### Postman collection
@@ -305,7 +613,7 @@ Import the following collection and set the environment variables `BASE_URL`, `C
 ```json
 {
   "info": {
-    "name": "go_oauth2_server Demo",
+    "name": "tokenator Demo",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [
@@ -329,7 +637,7 @@ Import the following collection and set the environment variables `BASE_URL`, `C
         "url": "{{BASE_URL}}/register/agent",
         "body": {
           "mode": "raw",
-          "raw": "{\n  \"agent_id\": \"{{AGENT_ID}}\",\n  \"name\": \"Data Ingestor\",\n  \"client_id\": \"{{CLIENT_ID}}\",\n  \"capabilities\": [\"orders:read\", \"orders:export\"],\n  \"tenant_id\": \"default\"\n}"
+          "raw": "{\n  \"agent_id\": \"{{AGENT_ID}}\",\n  \"name\": \"Data Ingestor\",\n  \"client_id\": \"{{CLIENT_ID}}\",\n  \"capabilities\": [\"tickets.read\", \"tickets.write\"],\n  \"tenant_id\": \"default\"\n}"
         }
       }
     },
@@ -348,7 +656,7 @@ Import the following collection and set the environment variables `BASE_URL`, `C
             {"key": "audience", "value": "http://localhost:9090"},
             {"key": "client_id", "value": "{{CLIENT_ID}}"},
             {"key": "client_secret", "value": "{{CLIENT_SECRET}}"},
-            {"key": "authorization_details", "value": "[{\"type\":\"agent-action\",\"actions\":[\"orders:export\"]}]"}
+            {"key": "authorization_details", "value": "[{\"type\":\"agent-action\",\"actions\":[\"tickets.export\"]}]"}
           ]
         }
       }
