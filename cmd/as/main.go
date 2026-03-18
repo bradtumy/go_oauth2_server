@@ -910,20 +910,54 @@ func (s *authorizationServer) handleClientCredentialsGrant(w http.ResponseWriter
 	log.Printf("[VALIDATE] ✓ Scope validated: %s", scope)
 
 	subject := "client:" + client.ID
-	log.Printf("[TOKEN] Issuing token: subject=%s, scope=%s", subject, scope)
 
-	access, expiresIn, err := s.signer.IssueAccess(r.Context(), subject, client.ID, scope)
-	if err != nil {
-		log.Printf("[TOKEN] ✗ Token issuance failed: %v", err)
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+	// RFC 9449: Check for DPoP header
+	dpopHeader := r.Header.Get("DPoP")
+	var access string
+	var expiresIn int
+	var err error
+	var tokenType string
+
+	if dpopHeader != "" {
+		// Validate DPoP proof for token request
+		log.Printf("[DPoP] DPoP header detected, validating proof...")
+		tokenEndpointURL := s.cfg.Issuer + "/token"
+		jkt, dpopErr := auth.ValidateDPoPForTokenRequest(dpopHeader, r.Method, tokenEndpointURL, s.jtiStore)
+		if dpopErr != nil {
+			log.Printf("[DPoP] ✗ DPoP validation failed: %v", dpopErr)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_dpop_proof", dpopErr.Error())
+			return
+		}
+
+		log.Printf("[DPoP] ✓ DPoP proof validated, binding token to jkt=%s...", jkt[:16]+"...")
+
+		// Issue DPoP-bound access token
+		access, expiresIn, err = s.signer.IssueAccessWithDPoP(r.Context(), subject, client.ID, scope, jkt, nil)
+		if err != nil {
+			log.Printf("[TOKEN] ✗ DPoP token issuance failed: %v", err)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
+			return
+		}
+
+		tokenType = "DPoP"
+		log.Printf("[TOKEN] ✓ DPoP-bound token issued: subject=%s, expires_in=%d", subject, expiresIn)
+	} else {
+		// Standard Bearer token
+		log.Printf("[TOKEN] Issuing standard bearer token: subject=%s, scope=%s", subject, scope)
+		access, expiresIn, err = s.signer.IssueAccess(r.Context(), subject, client.ID, scope)
+		if err != nil {
+			log.Printf("[TOKEN] ✗ Token issuance failed: %v", err)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
+			return
+		}
+
+		tokenType = "Bearer"
+		log.Printf("[TOKEN] ✓ Client credentials token issued: subject=%s, expires_in=%d", subject, expiresIn)
 	}
-
-	log.Printf("[TOKEN] ✓ Client credentials token issued: subject=%s, expires_in=%d", subject, expiresIn)
 
 	writeTokenResponse(w, map[string]any{
 		"access_token": access,
-		"token_type":   "bearer",
+		"token_type":   tokenType,
 		"expires_in":   expiresIn,
 		"scope":        scope,
 	})

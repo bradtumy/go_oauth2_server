@@ -82,7 +82,13 @@ func (s *Signer) IssueAccess(ctx context.Context, subject, clientID, scope strin
 
 // IssueAccessWithClaims issues an access token with additional private claims.
 func (s *Signer) IssueAccessWithClaims(ctx context.Context, subject, clientID, scope string, extra map[string]any) (string, int, error) {
-	return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra)
+	return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra, "")
+}
+
+// IssueAccessWithDPoP issues a DPoP-bound access token (RFC 9449).
+// The dpopJKT parameter is the JWK thumbprint that binds the token to a specific DPoP key.
+func (s *Signer) IssueAccessWithDPoP(ctx context.Context, subject, clientID, scope string, dpopJKT string, extra map[string]any) (string, int, error) {
+	return s.issue(ctx, subject, clientID, scope, nil, nil, s.accessTTL, s.audience, extra, dpopJKT)
 }
 
 // IssueOBOToken issues an OBO access token with given claims payload.
@@ -103,7 +109,9 @@ func (s *Signer) IssueOBOToken(ctx context.Context, subject, clientID string, pe
 	if actor != nil {
 		extraMap["act"] = actor
 	}
-	return s.issue(ctx, subject, clientID, "", perms, authz, ttl, audience, extraMap)
+	// Standard OAuth 2.0: convert perms array to space-separated scope string
+	scope := strings.Join(perms, " ")
+	return s.issue(ctx, subject, clientID, scope, perms, authz, ttl, audience, extraMap, "")
 }
 
 // IssueSubjectAssertion issues a subject assertion JWT for token exchange bootstrap.
@@ -114,10 +122,13 @@ func (s *Signer) IssueSubjectAssertion(ctx context.Context, subject string, ttl 
 	extra := map[string]any{
 		"token_use": "subject_assertion",
 	}
-	return s.issue(ctx, subject, subject, "", nil, nil, ttl, s.issuer, extra)
+	// For educational OAuth 2.0 demonstration: grant humans broad scope set
+	// In production, this should come from user entitlements/roles database
+	defaultHumanScopes := "tickets.read tickets.write orders.read orders.write"
+	return s.issue(ctx, subject, subject, defaultHumanScopes, nil, nil, ttl, s.issuer, extra, "")
 }
 
-func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, perms []string, authz any, ttl time.Duration, audience string, extra map[string]any) (token string, expiresIn int, err error) {
+func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, perms []string, authz any, ttl time.Duration, audience string, extra map[string]any, dpopJKT string) (token string, expiresIn int, err error) {
 	now := time.Now().UTC()
 	expires := now.Add(ttl)
 	claims := MapClaims{
@@ -133,11 +144,16 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 	if scope != "" {
 		claims["scope"] = scope
 	}
-	if len(perms) > 0 {
-		claims["perm"] = perms
-	}
+	// Note: perms parameter is deprecated - use authorization_details (RFC 9396) instead
+	// The perm claim was non-standard and has been removed for standards compliance
 	if authz != nil {
 		claims["authorization_details"] = authz
+	}
+	// RFC 9449: Add cnf (confirmation) claim for DPoP-bound tokens
+	if dpopJKT != "" {
+		claims["cnf"] = map[string]any{
+			"jkt": dpopJKT,
+		}
 	}
 	for k, v := range extra {
 		if v == nil {
