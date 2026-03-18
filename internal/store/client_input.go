@@ -19,6 +19,10 @@ type ClientInput struct {
 	GrantTypes   []string `json:"grant_types"`
 	Scopes       []string `json:"scopes"`
 	Audiences    []string `json:"audiences"`
+	// RFC 7523: JWT Bearer Client Assertions support
+	PublicKey    string   `json:"public_key"`
+	KeyAlgorithm string   `json:"key_algorithm"`
+	KeyID        string   `json:"key_id"`
 }
 
 func ValidateClientInput(input ClientInput) (ClientInput, error) {
@@ -33,11 +37,34 @@ func ValidateClientInput(input ClientInput) (ClientInput, error) {
 		return ClientInput{}, errors.New("client_type must be public or confidential")
 	}
 	input.ClientSecret = strings.TrimSpace(input.ClientSecret)
-	if input.ClientType == ClientTypeConfidential && input.ClientSecret == "" {
-		return ClientInput{}, errors.New("client_secret required for confidential clients")
+	input.PublicKey = strings.TrimSpace(input.PublicKey)
+	input.KeyAlgorithm = strings.TrimSpace(input.KeyAlgorithm)
+	input.KeyID = strings.TrimSpace(input.KeyID)
+
+	// RFC 7523: Confidential clients can use either client_secret OR public_key (not both required)
+	if input.ClientType == ClientTypeConfidential {
+		hasSecret := input.ClientSecret != ""
+		hasPublicKey := input.PublicKey != ""
+
+		if !hasSecret && !hasPublicKey {
+			return ClientInput{}, errors.New("confidential clients require either client_secret or public_key")
+		}
+
+		// If public key provided, validate it
+		if hasPublicKey {
+			if input.KeyAlgorithm == "" {
+				return ClientInput{}, errors.New("key_algorithm required when public_key is provided")
+			}
+			if !validKeyAlgorithm(input.KeyAlgorithm) {
+				return ClientInput{}, fmt.Errorf("unsupported key_algorithm %q (supported: RS256, RS384, RS512, ES256, ES384, ES512)", input.KeyAlgorithm)
+			}
+		}
 	}
 	if input.ClientType == ClientTypePublic {
 		input.ClientSecret = ""
+		input.PublicKey = ""
+		input.KeyAlgorithm = ""
+		input.KeyID = ""
 	}
 	input.RedirectURIs = normalizeList(input.RedirectURIs)
 	rawGrants := normalizeList(input.GrantTypes)
@@ -67,6 +94,15 @@ func ValidateClientInput(input ClientInput) (ClientInput, error) {
 func validGrantType(grant string) bool {
 	switch grant {
 	case GrantAuthorizationCode, GrantRefreshToken, GrantClientCredentials, GrantTokenExchange:
+		return true
+	default:
+		return false
+	}
+}
+
+func validKeyAlgorithm(alg string) bool {
+	switch alg {
+	case "RS256", "RS384", "RS512", "ES256", "ES384", "ES512":
 		return true
 	default:
 		return false

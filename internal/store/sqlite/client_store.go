@@ -36,6 +36,9 @@ redirect_uris TEXT NOT NULL,
 grant_types TEXT NOT NULL,
 scopes TEXT NOT NULL,
 audiences TEXT,
+public_key TEXT,
+key_algorithm TEXT,
+key_id TEXT,
 created_at TEXT NOT NULL,
 updated_at TEXT NOT NULL
 );`
@@ -57,7 +60,7 @@ func (s *ClientStore) CreateClient(ctx context.Context, client store.Client) (st
 		return store.Client{}, err
 	}
 	sql := fmt.Sprintf(
-		"INSERT INTO clients (client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, created_at, updated_at) VALUES ('%s','%s','%s','%s','%s','%s','%s','%s','%s');",
+		"INSERT INTO clients (client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, public_key, key_algorithm, key_id, created_at, updated_at) VALUES ('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s');",
 		sqlQuote(client.ID),
 		sqlQuote(client.Type),
 		sqlQuote(client.Secret),
@@ -65,6 +68,9 @@ func (s *ClientStore) CreateClient(ctx context.Context, client store.Client) (st
 		sqlQuote(payload.grantTypes),
 		sqlQuote(payload.scopes),
 		sqlQuote(payload.audiences),
+		sqlQuote(client.PublicKey),
+		sqlQuote(client.KeyAlgorithm),
+		sqlQuote(client.KeyID),
 		sqlQuote(client.CreatedAt.Format(time.RFC3339Nano)),
 		sqlQuote(client.UpdatedAt.Format(time.RFC3339Nano)),
 	)
@@ -79,7 +85,7 @@ func (s *ClientStore) CreateClient(ctx context.Context, client store.Client) (st
 }
 
 func (s *ClientStore) GetClient(ctx context.Context, id string) (store.Client, bool, error) {
-	sql := fmt.Sprintf("SELECT client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, created_at, updated_at FROM clients WHERE client_id = '%s';", sqlQuote(id))
+	sql := fmt.Sprintf("SELECT client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, public_key, key_algorithm, key_id, created_at, updated_at FROM clients WHERE client_id = '%s';", sqlQuote(id))
 	clients, err := s.queryClients(ctx, sql)
 	if err != nil {
 		return store.Client{}, false, err
@@ -91,7 +97,7 @@ func (s *ClientStore) GetClient(ctx context.Context, id string) (store.Client, b
 }
 
 func (s *ClientStore) ListClients(ctx context.Context) ([]store.Client, error) {
-	sql := "SELECT client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, created_at, updated_at FROM clients ORDER BY client_id;"
+	sql := "SELECT client_id, client_type, client_secret, redirect_uris, grant_types, scopes, audiences, public_key, key_algorithm, key_id, created_at, updated_at FROM clients ORDER BY client_id;"
 	return s.queryClients(ctx, sql)
 }
 
@@ -109,13 +115,16 @@ func (s *ClientStore) UpdateClient(ctx context.Context, client store.Client) (st
 		return store.Client{}, err
 	}
 	sql := fmt.Sprintf(
-		"UPDATE clients SET client_type='%s', client_secret='%s', redirect_uris='%s', grant_types='%s', scopes='%s', audiences='%s', updated_at='%s' WHERE client_id = '%s';",
+		"UPDATE clients SET client_type='%s', client_secret='%s', redirect_uris='%s', grant_types='%s', scopes='%s', audiences='%s', public_key='%s', key_algorithm='%s', key_id='%s', updated_at='%s' WHERE client_id = '%s';",
 		sqlQuote(client.Type),
 		sqlQuote(client.Secret),
 		sqlQuote(payload.redirectURIs),
 		sqlQuote(payload.grantTypes),
 		sqlQuote(payload.scopes),
 		sqlQuote(payload.audiences),
+		sqlQuote(client.PublicKey),
+		sqlQuote(client.KeyAlgorithm),
+		sqlQuote(client.KeyID),
 		sqlQuote(client.UpdatedAt.Format(time.RFC3339Nano)),
 		sqlQuote(client.ID),
 	)
@@ -203,6 +212,9 @@ func decodeRow(row map[string]any) (store.Client, error) {
 		Type: asString(row["client_type"]),
 	}
 	client.Secret = asString(row["client_secret"])
+	client.PublicKey = asString(row["public_key"])
+	client.KeyAlgorithm = asString(row["key_algorithm"])
+	client.KeyID = asString(row["key_id"])
 	if err := json.Unmarshal([]byte(asString(row["redirect_uris"])), &client.RedirectURIs); err != nil {
 		return store.Client{}, fmt.Errorf("decode redirect_uris: %w", err)
 	}

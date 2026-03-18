@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"tokenator/internal/auth"
 	"tokenator/internal/store"
 )
 
@@ -76,6 +77,18 @@ func (h *ClientHandler) createClient(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+
+	// RFC 7523: Validate public key if provided
+	if normalized.PublicKey != "" {
+		if err := auth.ValidatePublicKey(normalized.PublicKey, normalized.KeyAlgorithm); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":   "invalid_public_key",
+				"details": err.Error(),
+			})
+			return
+		}
+	}
+
 	client := clientFromInput(normalized)
 	created, err := h.store.CreateClient(r.Context(), client)
 	if err != nil {
@@ -119,6 +132,18 @@ func (h *ClientHandler) updateClient(w http.ResponseWriter, r *http.Request, id 
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return
 	}
+
+	// RFC 7523: Validate public key if provided
+	if normalized.PublicKey != "" {
+		if err := auth.ValidatePublicKey(normalized.PublicKey, normalized.KeyAlgorithm); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error":   "invalid_public_key",
+				"details": err.Error(),
+			})
+			return
+		}
+	}
+
 	existing, ok, err := h.store.GetClient(r.Context(), id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "get_failed"})
@@ -203,6 +228,9 @@ func clientFromInput(input store.ClientInput) store.Client {
 		GrantTypes:   input.GrantTypes,
 		Scopes:       input.Scopes,
 		Audiences:    input.Audiences,
+		PublicKey:    input.PublicKey,
+		KeyAlgorithm: input.KeyAlgorithm,
+		KeyID:        input.KeyID,
 	}
 }
 
