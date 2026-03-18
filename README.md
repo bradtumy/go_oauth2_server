@@ -11,10 +11,11 @@ An educational OAuth 2.0 authorization server and companion resource server writ
 - ✅ **OAuth Consent Flow**: User consent pages showing requested permissions before authorization
 - ✅ **Standard OAuth 2.0 Grants**: Authorization code with PKCE, client credentials, refresh token
 - ✅ **RFC 7523 JWT Bearer Client Assertions**: Agent authentication with signed JWTs (no static secrets)
+- ✅ **RFC 9449 DPoP**: Proof-of-possession tokens that prevent token theft and replay attacks
 - ✅ **RFC 8693 Token Exchange**: On-behalf-of (OBO) delegation for agent-on-human scenarios
 - ✅ **Rich Authorization Requests**: Fine-grained permissions with `authorization_details`
 - ✅ **Identity Management**: Built-in APIs for human and agent identity registration
-- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting, bcrypt password hashing, JTI replay protection
+- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting, bcrypt password hashing, JTI replay protection, DPoP token binding
 - ✅ **JWT Tokens**: Self-contained JWTs with RSA signatures and JWKS endpoint
 - ✅ **Admin API**: Dynamic client registration and management
 - ✅ **Test Scripts**: Automated end-to-end test suite in `/scripts`
@@ -223,7 +224,131 @@ curl -sS -X POST http://localhost:8080/token \
 ~/dev/tokenator/scripts/quick_rfc7523_demo.sh
 ```
 
-### 3. Authorization Code with PKCE (User Auth)
+### 3. DPoP - Proof-of-Possession Tokens (RFC 9449)
+
+Use RFC 9449 to **prevent token theft** by cryptographically binding access tokens to specific HTTP requests. Even if an attacker steals a DPoP-bound token, they cannot use it without the private key.
+
+**Security Benefits:**
+- ✅ Stolen tokens are useless without private key
+- ✅ Request-specific proof (HTTP method + URL validation)
+- ✅ Access token hash validation prevents substitution
+- ✅ Timestamp-based replay protection
+- ✅ Works with any OAuth grant type
+
+**Combined Flow: RFC 7523 + RFC 9449**
+
+This example combines JWT Bearer Client Assertions (RFC 7523) with DPoP (RFC 9449) for maximum security.
+
+**Step 1:** Generate keypair (can reuse RFC 7523 keys)
+
+```bash
+cd /tmp
+~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof -generate-keypair
+# Creates: dpop-private-key.pem, dpop-public-key.pem
+```
+
+**Step 2:** Register client with public key (same as RFC 7523)
+
+```bash
+PUBLIC_KEY=$(cat dpop-public-key.pem)
+
+curl -sS -X POST http://localhost:8080/admin/clients \
+  -H "Authorization: Bearer dev-admin-token" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"client_id\": \"agent-dpop\",
+    \"client_type\": \"confidential\",
+    \"public_key\": \"$PUBLIC_KEY\",
+    \"key_algorithm\": \"RS256\",
+    \"grant_types\": [\"client_credentials\"],
+    \"scopes\": [\"tickets.read\"]
+  }" | jq .
+```
+
+**Step 3:** Generate JWT assertion (RFC 7523)
+
+```bash
+ASSERTION=$(~/dev/tokenator/tools/mint_rfc7523_assertion/mint_rfc7523_assertion \
+  -client-id agent-dpop \
+  -private-key dpop-private-key.pem \
+  -audience http://localhost:8080/token)
+```
+
+**Step 4:** Generate DPoP proof for token request
+
+```bash
+DPOP_PROOF=$(~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof \
+  -private-key dpop-private-key.pem \
+  -method POST \
+  -url http://localhost:8080/token)
+```
+
+**Step 5:** Request DPoP-bound access token
+
+```bash
+curl -sS -X POST http://localhost:8080/token \
+  -H "DPoP: $DPOP_PROOF" \
+  -d "grant_type=client_credentials" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  -d "client_assertion=$ASSERTION" \
+  -d "scope=tickets.read" | jq .
+```
+
+**Response includes:**
+- `access_token`: JWT with `cnf.jkt` claim (DPoP-bound)
+- `token_type`: **"DPoP"** (not "Bearer")
+- `expires_in`: Token lifetime
+
+**Step 6:** Generate DPoP proof for resource request
+
+```bash
+# Extract access token from previous response
+ACCESS_TOKEN="<token_from_step_5>"
+
+# Generate proof with access token hash
+RESOURCE_DPOP=$(~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof \
+  -private-key dpop-private-key.pem \
+  -method GET \
+  -url http://localhost:9090/tickets \
+  -access-token "$ACCESS_TOKEN")
+```
+
+**Step 7:** Access protected resource with DPoP
+
+```bash
+curl -sS http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN" \
+  -H "DPoP: $RESOURCE_DPOP" | jq .
+```
+
+**What happens if token is stolen?**
+
+```bash
+# Attacker steals token but doesn't have private key
+curl http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN"
+# ✗ REJECTED: DPoP header required
+
+# Attacker tries with their own key
+curl http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN" \
+  -H "DPoP: <proof_with_wrong_key>"
+# ✗ REJECTED: JWK thumbprint mismatch
+```
+
+**DPoP Validation:**
+- Token has `cnf.jkt` claim linking it to specific public key
+- Each request requires fresh DPoP proof signed with private key
+- Proof includes HTTP method, URL, timestamp, and access token hash
+- Resource server verifies proof signature matches token binding
+
+**Testing:**
+```bash
+# Run comprehensive DPoP test suite (includes 6 attack scenarios)
+~/dev/tokenator/scripts/test_rfc9449_dpop.sh
+```
+
+### 4. Authorization Code with PKCE (User Auth)
 
 Requires **user authentication** via login page and consent before issuing tokens. This is the standard OAuth 2.0 flow for web and mobile applications.
 
@@ -295,7 +420,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 - `refresh_token`: Long-lived token for obtaining new access tokens
 - `expires_in`: Access token lifetime
 
-### 4. Refresh Token Grant
+### 5. Refresh Token Grant
 
 Exchange a refresh token for a new access token without user interaction.
 
@@ -309,7 +434,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 **Note:** Refresh token rotation is enabled. Each use generates a new refresh token and invalidates the old one. Reuse detection revokes the entire token family.
 
-### 5. Token Exchange (On-Behalf-Of)
+### 6. Token Exchange (On-Behalf-Of)
 
 Enable delegated access where an agent acts on behalf of a human with constrained permissions.
 
@@ -359,7 +484,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 The `perm` claim is a SHA-256 hash of the normalized `authorization_details`, enabling efficient permission verification.
 
-### 6. Resource Server Access
+### 7. Resource Server Access
 
 Call protected endpoints with the OBO access token.
 
