@@ -10,10 +10,12 @@ An educational OAuth 2.0 authorization server and companion resource server writ
 - ✅ **User Authentication**: Login/logout with password-based authentication and session management
 - ✅ **OAuth Consent Flow**: User consent pages showing requested permissions before authorization
 - ✅ **Standard OAuth 2.0 Grants**: Authorization code with PKCE, client credentials, refresh token
+- ✅ **RFC 7523 JWT Bearer Client Assertions**: Agent authentication with signed JWTs (no static secrets)
+- ✅ **RFC 9449 DPoP**: Proof-of-possession tokens that prevent token theft and replay attacks
 - ✅ **RFC 8693 Token Exchange**: On-behalf-of (OBO) delegation for agent-on-human scenarios
 - ✅ **Rich Authorization Requests**: Fine-grained permissions with `authorization_details`
 - ✅ **Identity Management**: Built-in APIs for human and agent identity registration
-- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting, bcrypt password hashing
+- ✅ **Production Security**: PKCE enforcement, refresh token rotation, rate limiting, bcrypt password hashing, JTI replay protection, DPoP token binding
 - ✅ **JWT Tokens**: Self-contained JWTs with RSA signatures and JWKS endpoint
 - ✅ **Admin API**: Dynamic client registration and management
 - ✅ **Test Scripts**: Automated end-to-end test suite in `/scripts`
@@ -144,7 +146,209 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 - `expires_in`: Token lifetime (default 3600s)
 - `token_type`: "Bearer"
 
-### 2. Authorization Code with PKCE (User Auth)
+### 2. JWT Bearer Client Assertions (RFC 7523) - Agent Authentication
+
+Use RFC 7523 for **agent authentication without static client secrets**. Agents authenticate using signed JWT assertions with their private key.
+
+**Security Benefits:**
+- ✅ No static secrets stored or transmitted
+- ✅ Cryptographic proof of identity
+- ✅ Automatic replay protection via JTI validation
+- ✅ Key rotation without client_id changes
+
+**Step 1:** Generate RSA-2048 keypair
+
+```bash
+# Using the built-in tool
+cd /tmp
+~/dev/tokenator/tools/mint_rfc7523_assertion/mint_rfc7523_assertion -generate-keypair
+
+# Or using openssl
+openssl genrsa -out agent-private-key.pem 2048
+openssl rsa -in agent-private-key.pem -pubout -out agent-public-key.pem
+```
+
+**Step 2:** Register agent with public key
+
+```bash
+PUBLIC_KEY=$(cat agent-public-key.pem)
+
+curl -sS -X POST http://localhost:8080/admin/clients \
+  -H "Authorization: Bearer dev-admin-token" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"client_id\": \"agent-rfc7523\",
+    \"client_type\": \"confidential\",
+    \"public_key\": \"$PUBLIC_KEY\",
+    \"key_algorithm\": \"RS256\",
+    \"grant_types\": [\"client_credentials\"],
+    \"scopes\": [\"tickets.read\", \"tickets.write\"]
+  }" | jq .
+```
+
+**Step 3:** Generate JWT assertion (signed with private key)
+
+```bash
+ASSERTION=$(~/dev/tokenator/tools/mint_rfc7523_assertion/mint_rfc7523_assertion \
+  -client-id agent-rfc7523 \
+  -private-key agent-private-key.pem \
+  -audience http://localhost:8080/token \
+  -algorithm RS256)
+```
+
+**Step 4:** Request access token using JWT assertion
+
+```bash
+curl -sS -X POST http://localhost:8080/token \
+  -d "grant_type=client_credentials" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  -d "client_assertion=$ASSERTION" \
+  -d "scope=tickets.read" | jq .
+```
+
+**Response includes:**
+- `access_token`: JWT containing agent identity and scopes
+- `expires_in`: Token lifetime (default 3600s)
+- `token_type`: "Bearer"
+
+**Supported Algorithms:**
+- RSA: RS256, RS384, RS512 (minimum 2048-bit keys)
+- ECDSA: ES256, ES384, ES512 (minimum 256-bit keys)
+
+**Testing:**
+```bash
+# Run comprehensive RFC 7523 test suite (includes attack scenarios)
+~/dev/tokenator/scripts/test_rfc7523_client_assertion.sh
+
+# Quick demonstration
+~/dev/tokenator/scripts/quick_rfc7523_demo.sh
+```
+
+### 3. DPoP - Proof-of-Possession Tokens (RFC 9449)
+
+Use RFC 9449 to **prevent token theft** by cryptographically binding access tokens to specific HTTP requests. Even if an attacker steals a DPoP-bound token, they cannot use it without the private key.
+
+**Security Benefits:**
+- ✅ Stolen tokens are useless without private key
+- ✅ Request-specific proof (HTTP method + URL validation)
+- ✅ Access token hash validation prevents substitution
+- ✅ Timestamp-based replay protection
+- ✅ Works with any OAuth grant type
+
+**Combined Flow: RFC 7523 + RFC 9449**
+
+This example combines JWT Bearer Client Assertions (RFC 7523) with DPoP (RFC 9449) for maximum security.
+
+**Step 1:** Generate keypair (can reuse RFC 7523 keys)
+
+```bash
+cd /tmp
+~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof -generate-keypair
+# Creates: dpop-private-key.pem, dpop-public-key.pem
+```
+
+**Step 2:** Register client with public key (same as RFC 7523)
+
+```bash
+PUBLIC_KEY=$(cat dpop-public-key.pem)
+
+curl -sS -X POST http://localhost:8080/admin/clients \
+  -H "Authorization: Bearer dev-admin-token" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"client_id\": \"agent-dpop\",
+    \"client_type\": \"confidential\",
+    \"public_key\": \"$PUBLIC_KEY\",
+    \"key_algorithm\": \"RS256\",
+    \"grant_types\": [\"client_credentials\"],
+    \"scopes\": [\"tickets.read\"]
+  }" | jq .
+```
+
+**Step 3:** Generate JWT assertion (RFC 7523)
+
+```bash
+ASSERTION=$(~/dev/tokenator/tools/mint_rfc7523_assertion/mint_rfc7523_assertion \
+  -client-id agent-dpop \
+  -private-key dpop-private-key.pem \
+  -audience http://localhost:8080/token)
+```
+
+**Step 4:** Generate DPoP proof for token request
+
+```bash
+DPOP_PROOF=$(~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof \
+  -private-key dpop-private-key.pem \
+  -method POST \
+  -url http://localhost:8080/token)
+```
+
+**Step 5:** Request DPoP-bound access token
+
+```bash
+curl -sS -X POST http://localhost:8080/token \
+  -H "DPoP: $DPOP_PROOF" \
+  -d "grant_type=client_credentials" \
+  -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+  -d "client_assertion=$ASSERTION" \
+  -d "scope=tickets.read" | jq .
+```
+
+**Response includes:**
+- `access_token`: JWT with `cnf.jkt` claim (DPoP-bound)
+- `token_type`: **"DPoP"** (not "Bearer")
+- `expires_in`: Token lifetime
+
+**Step 6:** Generate DPoP proof for resource request
+
+```bash
+# Extract access token from previous response
+ACCESS_TOKEN="<token_from_step_5>"
+
+# Generate proof with access token hash
+RESOURCE_DPOP=$(~/dev/tokenator/tools/mint_dpop_proof/mint_dpop_proof \
+  -private-key dpop-private-key.pem \
+  -method GET \
+  -url http://localhost:9090/tickets \
+  -access-token "$ACCESS_TOKEN")
+```
+
+**Step 7:** Access protected resource with DPoP
+
+```bash
+curl -sS http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN" \
+  -H "DPoP: $RESOURCE_DPOP" | jq .
+```
+
+**What happens if token is stolen?**
+
+```bash
+# Attacker steals token but doesn't have private key
+curl http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN"
+# ✗ REJECTED: DPoP header required
+
+# Attacker tries with their own key
+curl http://localhost:9090/tickets \
+  -H "Authorization: DPoP $ACCESS_TOKEN" \
+  -H "DPoP: <proof_with_wrong_key>"
+# ✗ REJECTED: JWK thumbprint mismatch
+```
+
+**DPoP Validation:**
+- Token has `cnf.jkt` claim linking it to specific public key
+- Each request requires fresh DPoP proof signed with private key
+- Proof includes HTTP method, URL, timestamp, and access token hash
+- Resource server verifies proof signature matches token binding
+
+**Testing:**
+```bash
+# Run comprehensive DPoP test suite (includes 6 attack scenarios)
+~/dev/tokenator/scripts/test_rfc9449_dpop.sh
+```
+
+### 4. Authorization Code with PKCE (User Auth)
 
 Requires **user authentication** via login page and consent before issuing tokens. This is the standard OAuth 2.0 flow for web and mobile applications.
 
@@ -216,7 +420,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 - `refresh_token`: Long-lived token for obtaining new access tokens
 - `expires_in`: Access token lifetime
 
-### 3. Refresh Token Grant
+### 5. Refresh Token Grant
 
 Exchange a refresh token for a new access token without user interaction.
 
@@ -230,7 +434,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 **Note:** Refresh token rotation is enabled. Each use generates a new refresh token and invalidates the old one. Reuse detection revokes the entire token family.
 
-### 4. Token Exchange (On-Behalf-Of)
+### 6. Token Exchange (On-Behalf-Of)
 
 Enable delegated access where an agent acts on behalf of a human with constrained permissions.
 
@@ -280,7 +484,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
 
 The `perm` claim is a SHA-256 hash of the normalized `authorization_details`, enabling efficient permission verification.
 
-### 5. Resource Server Access
+### 7. Resource Server Access
 
 Call protected endpoints with the OBO access token.
 
@@ -368,6 +572,55 @@ Retrieve public keys for JWT verification (used by RS and external services).
 ```bash
 curl -sS http://localhost:8080/.well-known/jwks.json | jq .
 ```
+
+### OAuth Authorization Server Metadata (RFC 8414)
+
+Discover OAuth authorization server metadata.
+
+```bash
+curl -sS http://localhost:8080/.well-known/oauth-authorization-server | jq .
+```
+
+### OpenID Provider Metadata
+
+Discover OpenID Connect metadata.
+
+```bash
+curl -sS http://localhost:8080/.well-known/openid-configuration | jq .
+```
+
+### OAuth Protected Resource Metadata (RFC 9728)
+
+Discover protected resource metadata exposed by the RS.
+
+```bash
+curl -sS http://localhost:9090/.well-known/oauth-protected-resource | jq .
+```
+
+Run all well-known endpoint checks with explanations:
+
+```bash
+./scripts/test_well_known_endpoints.sh
+```
+
+Optional base URL overrides:
+
+```bash
+AS_BASE=http://localhost:8080 RS_BASE=http://localhost:9090 ./scripts/test_well_known_endpoints.sh
+```
+
+### Metadata Capability Matrix
+
+| Endpoint | Purpose | Key fields currently exposed | Spec |
+|---|---|---|---|
+| `/.well-known/jwks.json` | Signing key discovery | `keys[]` with `kid`, `kty`, `alg`, `use`, `n`, `e` | JWKS (RFC 7517) |
+| `/.well-known/oauth-authorization-server` | OAuth AS metadata | `issuer`, `authorization_endpoint`, `token_endpoint`, `jwks_uri`, `introspection_endpoint`, `revocation_endpoint`, supported grants/auth methods | RFC 8414 |
+| `/.well-known/openid-configuration` | OIDC provider metadata | `issuer`, OAuth endpoints, `jwks_uri`, response/grant support, signing alg support | OIDC Discovery |
+| `/.well-known/oauth-protected-resource` | Resource metadata for clients/AS | `resource`, `authorization_servers`, `jwks_uri`, `bearer_methods_supported` | RFC 9728 |
+
+Notes:
+- Metadata intentionally advertises only capabilities currently implemented by tokenator.
+- OIDC metadata is provided for ecosystem compatibility; full OIDC feature parity is not implied.
 
 ### Health Checks
 
@@ -903,6 +1156,7 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 | `AS_ACCESS_TOKEN_TTL_SECONDS`      | Access token lifetime (seconds)                                                             | `3600`                          |
 | `AS_REFRESH_TOKEN_TTL_SECONDS`     | Refresh token lifetime (seconds)                                                            | `86400`                         |
 | `AS_OBO_TOKEN_TTL_SECONDS`         | OBO token lifetime (seconds)                                                                | `900`                           |
+| `ENABLE_RAR`                       | Enable Rich Authorization Requests (RFC 9396). Set to `false` for scope-only authorization | `true`                          |
 | `AS_RATE_LIMIT_AUTHORIZE_RPS`      | Rate limit (requests/sec) for `/oauth2/authorize`                                           | `5`                             |
 | `AS_RATE_LIMIT_AUTHORIZE_BURST`    | Burst limit for `/oauth2/authorize`                                                         | `10`                            |
 | `AS_RATE_LIMIT_TOKEN_RPS`          | Rate limit (requests/sec) for `/oauth2/token`                                               | `10`                            |
@@ -913,6 +1167,39 @@ Unit tests cover validation logic, the in-memory identity store, HTTP handlers, 
 | `AS_RATE_LIMIT_ADMIN_BURST`        | Burst limit for `/admin/*`                                                                  | `10`                            |
 
 All configuration is logged at server startup (secrets are masked in logs).
+
+### Rich Authorization Requests (RAR)
+
+Tokenator supports [RFC 9396 Rich Authorization Requests](https://www.rfc-editor.org/rfc/rfc9396.html) for fine-grained permissions using `authorization_details`.
+
+**To disable RAR and use scope-only authorization:**
+
+```bash
+# In .env or docker-compose.yml
+ENABLE_RAR=false
+```
+
+**When RAR is disabled:**
+- Token exchange requests with `authorization_details` are rejected (400 Bad Request)
+- Only `scope` parameter is accepted
+- Tokens contain only `scope` claim (no `authorization_details`)
+- Resource server ignores `authorization_details` if present in tokens
+- Forces use of consent-based authorization flow
+
+**Use case:** Educational comparison of coarse-grained (scope) vs fine-grained (RAR) authorization, and enforcing proper human consent validation.
+
+**Test both modes:**
+
+```bash
+# Test with RAR enabled (default)
+./scripts/test_complete_obo_flow.sh
+
+# Test with RAR disabled
+ENABLE_RAR=false USE_SCOPE_ONLY=true ./scripts/test_complete_obo_flow.sh
+
+# Or use dedicated script
+./scripts/test_scope_only_flow.sh
+```
 
 ## Project Structure
 

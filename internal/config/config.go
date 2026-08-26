@@ -14,6 +14,7 @@ import (
 // Config represents runtime configuration for the authorization server.
 type Config struct {
 	Issuer                     string
+	MetadataIssuer             string
 	Audience                   string
 	SigningKeyPEM              []byte
 	SigningKeyID               string
@@ -26,6 +27,7 @@ type Config struct {
 	AdminToken                 string
 	AllowLegacy                bool
 	DevMode                    bool
+	EnableRAR                  bool
 	SeedIdentitiesPath         string
 	ClientDBPath               string
 	ClientStoreDriver          string
@@ -93,6 +95,7 @@ odOEQaR0ILGMQJZmpfvekDyK
 func Load() (*Config, error) {
 	cfg := &Config{
 		Issuer:             firstNonEmpty(getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
+		MetadataIssuer:     firstNonEmpty(getEnv("AS_METADATA_ISSUER", ""), getEnv("ISSUER", ""), getEnv("AS_ISSUER", defaultIssuer)),
 		Audience:           firstNonEmpty(getEnv("RS_AUDIENCE", ""), getEnv("AS_AUDIENCE", defaultAudience)),
 		SigningKeyID:       getEnv("AS_SIGNING_KEY_ID", defaultSigningKeyID),
 		SigningKeyDir:      getEnv("AS_SIGNING_KEYS_DIR", ""),
@@ -152,6 +155,14 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.DevMode = devMode
+
+	// RFC 9396 Rich Authorization Requests. Defaults on; set ENABLE_RAR=false to
+	// fall back to scope-only authorization.
+	enableRAR, err := parseBool("ENABLE_RAR", true)
+	if err != nil {
+		return nil, err
+	}
+	cfg.EnableRAR = enableRAR
 
 	authorizeRPS, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_RPS", defaultAuthorizeRPS)
 	if err != nil {

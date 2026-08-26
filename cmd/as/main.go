@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"tokenator/internal/admin"
 	"tokenator/internal/auth"
 	"tokenator/internal/config"
@@ -77,6 +78,10 @@ func main() {
 	}
 	oboService := &obo.Service{Signer: signer, Issuer: cfg.Issuer, Audience: cfg.Audience, OBOTTL: cfg.OBOTokenTTL}
 
+	// RFC 7523 & RFC 9449: Initialize JTI store for replay protection
+	jtiStore := store.NewJTIStore()
+	log.Printf("JTI store initialized for RFC 7523 (JWT assertions) and RFC 9449 (DPoP) replay protection")
+
 	srv := &authorizationServer{
 		cfg:                cfg,
 		store:              st,
@@ -85,6 +90,7 @@ func main() {
 		oboService:         oboService,
 		identities:         identityStore,
 		authHandler:        authHandler,
+		jtiStore:           jtiStore,
 		allowLegacy:        cfg.AllowLegacy,
 		legacyUsers:        map[string]string{"user:123": "demo-user"},
 		legacyDefaultHuman: "user:123",
@@ -101,6 +107,8 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 	}))
 	mux.Handle("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
+	mux.Handle("/.well-known/oauth-authorization-server", methodHandler(http.MethodGet, srv.handleAuthorizationServerMetadata))
+	mux.Handle("/.well-known/openid-configuration", methodHandler(http.MethodGet, srv.handleOpenIDConfiguration))
 
 	// Authentication routes
 	mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
@@ -181,6 +189,7 @@ type authorizationServer struct {
 	oboService         *obo.Service
 	identities         identity.Store
 	authHandler        *auth.Handler
+	jtiStore           *store.JTIStore // RFC 7523 & RFC 9449: Replay protection
 	allowLegacy        bool
 	legacyUsers        map[string]string
 	legacyDefaultHuman string
@@ -306,6 +315,66 @@ func (s *authorizationServer) handleJWKS(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, jwks)
+}
+
+// clientAssertionAlgValues are the algorithms accepted for RFC 7523 private_key_jwt
+// client assertions, matching the key types auth.ValidatePublicKey will parse.
+var clientAssertionAlgValues = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
+// dpopAlgValues are the algorithms accepted on RFC 9449 DPoP proofs. Proof keys
+// arrive as a JWK in the header, so both RSA and EC signatures are verifiable.
+var dpopAlgValues = []string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"}
+
+func (s *authorizationServer) handleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
+	issuer := strings.TrimSpace(s.cfg.MetadataIssuer)
+	if issuer == "" {
+		issuer = strings.TrimSpace(s.cfg.Issuer)
+	}
+	issuer = strings.TrimRight(issuer, "/")
+
+	metadata := map[string]any{
+		"issuer":                                issuer,
+		"authorization_endpoint":                issuer + "/oauth2/authorize",
+		"token_endpoint":                        issuer + "/oauth2/token",
+		"jwks_uri":                              issuer + "/.well-known/jwks.json",
+		"introspection_endpoint":                issuer + "/oauth2/introspect",
+		"revocation_endpoint":                   issuer + "/oauth2/revoke",
+		"response_types_supported":              []string{"code"},
+		"grant_types_supported":                 []string{"authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "private_key_jwt", "none"},
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionAlgValues,
+		"dpop_signing_alg_values_supported":                dpopAlgValues,
+		"code_challenge_methods_supported":                 []string{"S256"},
+		"scopes_supported":                                 []string{"openid", "orders:read", "orders:export"},
+	}
+
+	writeJSON(w, http.StatusOK, metadata)
+}
+
+func (s *authorizationServer) handleOpenIDConfiguration(w http.ResponseWriter, r *http.Request) {
+	issuer := strings.TrimSpace(s.cfg.MetadataIssuer)
+	if issuer == "" {
+		issuer = strings.TrimSpace(s.cfg.Issuer)
+	}
+	issuer = strings.TrimRight(issuer, "/")
+
+	metadata := map[string]any{
+		"issuer":                                           issuer,
+		"authorization_endpoint":                           issuer + "/oauth2/authorize",
+		"token_endpoint":                                   issuer + "/oauth2/token",
+		"jwks_uri":                                         issuer + "/.well-known/jwks.json",
+		"response_types_supported":                         []string{"code"},
+		"grant_types_supported":                            []string{"authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"},
+		"subject_types_supported":                          []string{"public"},
+		"id_token_signing_alg_values_supported":            []string{"RS256"},
+		"scopes_supported":                                 []string{"openid", "orders:read", "orders:export"},
+		"token_endpoint_auth_methods_supported":            []string{"client_secret_basic", "client_secret_post", "private_key_jwt", "none"},
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionAlgValues,
+		"dpop_signing_alg_values_supported":                dpopAlgValues,
+		"code_challenge_methods_supported":                 []string{"S256"},
+	}
+
+	writeJSON(w, http.StatusOK, metadata)
 }
 
 func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Request) {
@@ -452,16 +521,23 @@ func (s *authorizationServer) handleConsent(w http.ResponseWriter, r *http.Reque
 
 func (s *authorizationServer) handleToken(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
+		log.Printf("[OAUTH_FLOW] ✗ Unable to parse form: %v", err)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "unable to parse form")
 		return
 	}
 
 	grantType := r.PostFormValue("grant_type")
+	log.Printf("[OAUTH_FLOW] → Token request: grant_type=%s", grantType)
+
 	client, err := s.authenticateClient(r, grantType)
 	if err != nil {
+		log.Printf("[AUTH] ✗ Client authentication failed: %v", err)
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
+
+	log.Printf("[AUTH] ✓ Client authenticated: client_id=%s", client.ID)
+
 	switch grantType {
 	case "authorization_code":
 		s.handleAuthorizationCodeGrant(w, r, client)
@@ -472,6 +548,7 @@ func (s *authorizationServer) handleToken(w http.ResponseWriter, r *http.Request
 	case "urn:ietf:params:oauth:grant-type:token-exchange":
 		s.handleTokenExchange(w, r, client)
 	default:
+		log.Printf("[OAUTH_FLOW] ✗ Unsupported grant type: %s", grantType)
 		writeOAuthError(w, http.StatusBadRequest, "unsupported_grant_type", "grant type not supported")
 	}
 }
@@ -605,68 +682,108 @@ func (s *authorizationServer) handleSubjectAssertion(w http.ResponseWriter, r *h
 }
 
 func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
+	log.Printf("[TOKEN] Processing authorization code grant: client_id=%s", client.ID)
+
 	code := r.PostFormValue("code")
 	redirectURI := r.PostFormValue("redirect_uri")
 	if code == "" {
+		log.Printf("[VALIDATE] ✗ Authorization code missing")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "code required")
 		return
 	}
+
+	codePrefix := code
+	if len(code) > 10 {
+		codePrefix = code[:10] + "..."
+	}
+	log.Printf("[VALIDATE] Verifying authorization code: %s", codePrefix)
+
 	record, err := s.store.ConsumeCode(code)
 	if err != nil {
+		log.Printf("[VALIDATE] ✗ Invalid or already consumed code")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid code")
 		return
 	}
+
 	if record.ClientID != client.ID {
+		log.Printf("[VALIDATE] ✗ Code not issued to this client: code_client=%s, request_client=%s", record.ClientID, client.ID)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code not issued to client")
 		return
 	}
+
 	if time.Now().After(record.ExpiresAt) {
+		log.Printf("[VALIDATE] ✗ Authorization code expired: expired_at=%v", record.ExpiresAt)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code expired")
 		return
 	}
+
 	if redirectURI != "" && redirectURI != record.RedirectURI {
+		log.Printf("[VALIDATE] ✗ Redirect URI mismatch: expected=%s, got=%s", record.RedirectURI, redirectURI)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
 		return
 	}
+
+	log.Printf("[VALIDATE] ✓ Code valid: client_match=true, not_expired=true, redirect_uri_match=true")
+
 	if record.CodeChallenge != "" {
 		codeVerifier := strings.TrimSpace(r.PostFormValue("code_verifier"))
+		log.Printf("[VALIDATE] Verifying PKCE: method=%s", record.CodeChallengeMethod)
+
 		if !validCodeVerifier(codeVerifier) {
+			log.Printf("[VALIDATE] ✗ Invalid code_verifier format")
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "invalid code_verifier")
 			return
 		}
+
 		if !verifyPKCE(record.CodeChallengeMethod, record.CodeChallenge, codeVerifier) {
+			log.Printf("[VALIDATE] ✗ PKCE verification failed")
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier mismatch")
 			return
 		}
+		log.Printf("[VALIDATE] ✓ PKCE verified successfully")
 	} else if client.Type == store.ClientTypePublic {
+		log.Printf("[VALIDATE] ✗ PKCE required for public clients but not provided")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "code_verifier required for public clients")
 		return
 	}
+
 	if !scopeSubsetList(record.Scope, client.Scopes) {
+		log.Printf("[VALIDATE] ✗ Scope not allowed: requested=%s, allowed=%v", record.Scope, client.Scopes)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
 		return
 	}
+	log.Printf("[VALIDATE] ✓ Scope validated: %s", record.Scope)
+
+	log.Printf("[VALIDATE] Looking up human: human_id=%s", record.HumanID)
 	human, err := s.lookupHumanByID(r.Context(), record.HumanID)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, identity.ErrHumanNotFound) {
+			log.Printf("[VALIDATE] ✗ Human not found: %s", record.HumanID)
 			if !s.allowLegacy {
 				writeOAuthError(w, status, "invalid_grant", "human not registered")
 				return
 			}
 		} else {
+			log.Printf("[VALIDATE] ✗ Error looking up human: %v", err)
 			status = http.StatusInternalServerError
 		}
 		writeOAuthError(w, status, "invalid_grant", err.Error())
 		return
 	}
+	log.Printf("[VALIDATE] ✓ Human found: %s (%s)", human.ID, human.Email)
+
+	log.Printf("[TOKEN] Issuing tokens: subject=%s, scope=%s", human.ID, record.Scope)
 	access, expiresIn, err := s.signer.IssueAccessWithClaims(r.Context(), human.ID, client.ID, record.Scope, s.humanExtraClaims(human))
 	if err != nil {
+		log.Printf("[TOKEN] ✗ Token issuance failed: %v", err)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
+
 	refresh := random.NewID()
 	familyID := random.NewID()
+	log.Printf("[TOKEN] Generating refresh token: family_id=%s", familyID)
 	s.store.SaveRefreshToken(store.RefreshToken{
 		Token:     refresh,
 		ClientID:  client.ID,
@@ -676,6 +793,9 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 		IssuedAt:  time.Now().UTC(),
 		ExpiresAt: time.Now().Add(s.cfg.RefreshTokenTTL),
 	})
+
+	log.Printf("[TOKEN] ✓ Tokens issued: subject=%s, expires_in=%d, refresh_token=true", human.ID, expiresIn)
+
 	writeTokenResponse(w, map[string]any{
 		"access_token":  access,
 		"token_type":    "bearer",
@@ -686,41 +806,66 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 }
 
 func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
+	log.Printf("[TOKEN] Processing refresh token grant: client_id=%s", client.ID)
+
 	token := r.PostFormValue("refresh_token")
 	if token == "" {
+		log.Printf("[VALIDATE] ✗ Refresh token missing")
 		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "refresh_token required")
 		return
 	}
+
+	tokenPrefix := token
+	if len(token) > 10 {
+		tokenPrefix = token[:10] + "..."
+	}
+	log.Printf("[VALIDATE] Looking up refresh token: %s", tokenPrefix)
+
 	rt, ok := s.store.GetRefreshToken(token)
 	if !ok || rt.ClientID != client.ID {
+		log.Printf("[VALIDATE] ✗ Unknown or mismatched refresh token: found=%v, client_match=%v", ok, ok && rt.ClientID == client.ID)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown refresh token")
 		return
 	}
+	log.Printf("[VALIDATE] ✓ Refresh token found: family_id=%s", rt.FamilyID)
+
 	if !rt.ConsumedAt.IsZero() {
+		log.Printf("[VALIDATE] ✗ Refresh token reuse detected! Revoking entire family: family_id=%s", rt.FamilyID)
 		s.store.RevokeRefreshTokenFamily(token)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected")
 		return
 	}
+	log.Printf("[VALIDATE] ✓ No token reuse detected")
+
 	if !scopeSubsetList(rt.Scope, client.Scopes) {
+		log.Printf("[VALIDATE] ✗ Scope not allowed: token_scope=%s, allowed=%v", rt.Scope, client.Scopes)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
 		return
 	}
+
 	if time.Now().After(rt.ExpiresAt) {
+		log.Printf("[VALIDATE] ✗ Refresh token expired: expires_at=%v", rt.ExpiresAt)
 		s.store.RevokeRefreshTokenFamily(token)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
+	log.Printf("[VALIDATE] ✓ Refresh token valid: expires_at=%v", rt.ExpiresAt)
+
 	human, err := s.lookupHumanByID(r.Context(), rt.HumanID)
 	if err != nil {
 		status := http.StatusBadRequest
 		if !errors.Is(err, identity.ErrHumanNotFound) {
 			status = http.StatusInternalServerError
 		}
+		log.Printf("[VALIDATE] ✗ Human lookup failed: %v", err)
 		writeOAuthError(w, status, "invalid_grant", err.Error())
 		return
 	}
+
+	log.Printf("[TOKEN] Rotating refresh token: old_family_id=%s", rt.FamilyID)
 	access, expiresIn, err := s.signer.IssueAccessWithClaims(r.Context(), human.ID, client.ID, rt.Scope, s.humanExtraClaims(human))
 	if err != nil {
+		log.Printf("[TOKEN] ✗ Token issuance failed: %v", err)
 		writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
@@ -734,14 +879,21 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 		IssuedAt:  time.Now().UTC(),
 		ExpiresAt: rt.ExpiresAt,
 	}
+
+	log.Printf("[TOKEN] Rotating to new refresh token in family: %s", rt.FamilyID)
 	if _, err := s.store.RotateRefreshToken(token, next); err != nil {
 		if errors.Is(err, store.ErrRefreshTokenConsumed) || errors.Is(err, store.ErrRefreshTokenFamilyReset) {
+			log.Printf("[TOKEN] ✗ Rotation failed - token was consumed concurrently: %v", err)
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected")
 			return
 		}
+		log.Printf("[TOKEN] ✗ Rotation failed: %v", err)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "unknown refresh token")
 		return
 	}
+
+	log.Printf("[TOKEN] ✓ Refresh token rotated successfully: subject=%s, family_id=%s", human.ID, rt.FamilyID)
+
 	writeTokenResponse(w, map[string]any{
 		"access_token":  access,
 		"token_type":    "bearer",
@@ -752,23 +904,72 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 }
 
 func (s *authorizationServer) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
+	log.Printf("[TOKEN] Processing client credentials grant: client_id=%s", client.ID)
+
 	scope := r.PostFormValue("scope")
 	if scope == "" {
 		scope = strings.Join(client.Scopes, " ")
+		log.Printf("[VALIDATE] No scope requested, using client default scopes: %s", scope)
+	} else {
+		log.Printf("[VALIDATE] Requested scope: %s", scope)
 	}
+
 	if !scopeSubsetList(scope, client.Scopes) {
+		log.Printf("[VALIDATE] ✗ Requested scope not allowed: requested=%s, allowed=%v", scope, client.Scopes)
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
 		return
 	}
+	log.Printf("[VALIDATE] ✓ Scope validated: %s", scope)
+
 	subject := "client:" + client.ID
-	access, expiresIn, err := s.signer.IssueAccess(r.Context(), subject, client.ID, scope)
-	if err != nil {
-		writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
-		return
+
+	// RFC 9449: Check for DPoP header
+	dpopHeader := r.Header.Get("DPoP")
+	var access string
+	var expiresIn int
+	var err error
+	var tokenType string
+
+	if dpopHeader != "" {
+		// Validate DPoP proof for token request
+		log.Printf("[DPoP] DPoP header detected, validating proof...")
+		tokenEndpointURL := s.cfg.Issuer + "/token"
+		jkt, dpopErr := auth.ValidateDPoPForTokenRequest(dpopHeader, r.Method, tokenEndpointURL, s.jtiStore)
+		if dpopErr != nil {
+			log.Printf("[DPoP] ✗ DPoP validation failed: %v", dpopErr)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_dpop_proof", dpopErr.Error())
+			return
+		}
+
+		log.Printf("[DPoP] ✓ DPoP proof validated, binding token to jkt=%s...", jkt[:16]+"...")
+
+		// Issue DPoP-bound access token
+		access, expiresIn, err = s.signer.IssueAccessWithDPoP(r.Context(), subject, client.ID, scope, jkt, nil)
+		if err != nil {
+			log.Printf("[TOKEN] ✗ DPoP token issuance failed: %v", err)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
+			return
+		}
+
+		tokenType = "DPoP"
+		log.Printf("[TOKEN] ✓ DPoP-bound token issued: subject=%s, expires_in=%d", subject, expiresIn)
+	} else {
+		// Standard Bearer token
+		log.Printf("[TOKEN] Issuing standard bearer token: subject=%s, scope=%s", subject, scope)
+		access, expiresIn, err = s.signer.IssueAccess(r.Context(), subject, client.ID, scope)
+		if err != nil {
+			log.Printf("[TOKEN] ✗ Token issuance failed: %v", err)
+			writeOAuthError(w, http.StatusInternalServerError, "server_error", err.Error())
+			return
+		}
+
+		tokenType = "Bearer"
+		log.Printf("[TOKEN] ✓ Client credentials token issued: subject=%s, expires_in=%d", subject, expiresIn)
 	}
+
 	writeTokenResponse(w, map[string]any{
 		"access_token": access,
-		"token_type":   "bearer",
+		"token_type":   tokenType,
 		"expires_in":   expiresIn,
 		"scope":        scope,
 	})
@@ -797,24 +998,55 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 
-	rarRaw := r.PostFormValue("authorization_details")
-	rar, err := obo.ParseRAR(rarRaw)
-	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
-		return
-	}
-	if len(rar) == 0 {
-		scope := r.PostFormValue("scope")
-		if scope != "" {
-			actions := strings.Fields(scope)
-			if len(actions) > 0 {
-				rar = []obo.RAR{{
-					Type:    "scope",
-					Actions: actions,
-				}}
+	enableRAR := s.cfg.EnableRAR
+	log.Printf("[TOKEN_EXCHANGE] Starting token exchange: enable_rar=%v, client_id=%s", enableRAR, client.ID)
+	var rar []obo.RAR
+	var err error
+
+	if enableRAR {
+		// RAR mode: parse authorization_details with scope fallback
+		rarRaw := r.PostFormValue("authorization_details")
+		rar, err = obo.ParseRAR(rarRaw)
+		if err != nil {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+		// Fallback: convert scope to RAR if no authorization_details
+		if len(rar) == 0 {
+			scope := r.PostFormValue("scope")
+			if scope != "" {
+				actions := strings.Fields(scope)
+				if len(actions) > 0 {
+					rar = []obo.RAR{{
+						Type:    "scope",
+						Actions: actions,
+					}}
+				}
 			}
 		}
+	} else {
+		// Scope-only mode: reject authorization_details, require scope
+		if r.PostFormValue("authorization_details") != "" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+				"authorization_details not supported (ENABLE_RAR=false)")
+			return
+		}
+		scope := r.PostFormValue("scope")
+		if scope == "" {
+			writeOAuthError(w, http.StatusBadRequest, "invalid_request",
+				"scope required when RAR disabled")
+			return
+		}
+		// Convert scope to internal format for processing
+		actions := strings.Fields(scope)
+		if len(actions) > 0 {
+			rar = []obo.RAR{{
+				Type:    "scope",
+				Actions: actions,
+			}}
+		}
 	}
+	log.Printf("[TOKEN_EXCHANGE] RAR after parsing: %+v", rar)
 
 	subject, subjectClaims, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
 	if err != nil {
@@ -825,16 +1057,25 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		writeOAuthError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
-	requestedScope := strings.TrimSpace(r.PostFormValue("scope"))
-	if requestedScope != "" && !scopeSubsetList(requestedScope, client.Scopes) {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
-		return
-	}
-	if requestedScope != "" {
-		if !scopeSubset(requestedScope, subjectClaims["scope"]) {
+
+	// Standard OAuth 2.0: Validate requested scopes/actions against BOTH client and subject scopes
+	// Extract all requested actions from RAR (which may have come from scope parameter or authorization_details)
+	requestedActions := extractActionsFromRAR(rar)
+	log.Printf("[TOKEN_EXCHANGE] Validating scopes: requested_actions=%v, client_scopes=%v", requestedActions, client.Scopes)
+	if len(requestedActions) > 0 {
+		// Step 1: Check client-level scope restrictions (what the client is allowed to request)
+		if !scopeSubsetList(strings.Join(requestedActions, " "), client.Scopes) {
+			log.Printf("[TOKEN_EXCHANGE] ✗ Scope validation failed: requested %v not subset of client scopes %v", requestedActions, client.Scopes)
+			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed for this client")
+			return
+		}
+		// Step 2: Check subject-level scopes (what the human has granted)
+		if !scopeSubset(strings.Join(requestedActions, " "), subjectClaims["scope"]) {
+			log.Printf("[TOKEN_EXCHANGE] ✗ Scope validation failed: requested %v exceeds subject scopes", requestedActions)
 			writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope exceeds subject token scope")
 			return
 		}
+		log.Printf("[TOKEN_EXCHANGE] ✓ Scope validation passed")
 	}
 	human, err := s.lookupHumanByID(r.Context(), subject)
 	if err != nil {
@@ -871,7 +1112,28 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 
-	perms, filteredRAR, hash, err := s.oboService.ComputePerms(human.ID, rar, agent.Capabilities)
+	// Standard OAuth 2.0 Token Exchange (RFC 8693) behavior:
+	// The agent can only access what BOTH the client is allowed to request AND
+	// what the human has been granted. Compute the intersection of client and subject scopes.
+	// Extract subject's authorized scopes
+	subjectScope := ""
+	if scopeClaim, ok := subjectClaims["scope"].(string); ok {
+		subjectScope = scopeClaim
+	}
+	subjectScopes := strings.Fields(subjectScope)
+
+	// Compute intersection: client.Scopes ∩ subject.scopes ∩ agent.Capabilities.
+	// This is the maximum set of scopes the agent can be granted. The agent's own
+	// capabilities are part of the intersection: without them any agent
+	// registered to a client could exercise that client's entire scope set,
+	// ignoring the per-agent restrictions capabilities exist to express.
+	// An agent registered with no capabilities is therefore granted nothing.
+	allowedScopes := intersectScopes(client.Scopes, subjectScopes)
+	allowedScopes = intersectScopes(allowedScopes, agent.Capabilities)
+
+	// Pass the allowed scope intersection to ComputePerms
+	// ComputePerms will further filter based on requested scopes/actions
+	perms, filteredRAR, hash, err := s.oboService.ComputePerms(human.ID, rar, allowedScopes)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, obo.ErrNoPermissions) {
@@ -886,9 +1148,13 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		Aud:                   audience,
 		Sub:                   human.ID,
 		Act:                   obo.ActClaim{Actor: agent.ID, ClientID: agent.ClientID, InstanceID: actClaim.InstanceID},
-		AuthorizationDetails:  filteredRAR,
 		Perm:                  perms,
 		HumanEntitlementsHash: hash,
+	}
+
+	// Only include RAR in token if enabled
+	if enableRAR {
+		claims.AuthorizationDetails = filteredRAR
 	}
 
 	token, expiresIn, err := s.oboService.IssueOBOToken(r.Context(), claims)
@@ -897,19 +1163,34 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 
-	writeTokenResponse(w, map[string]any{
-		"access_token":          token,
-		"issued_token_type":     "urn:ietf:params:oauth:token-type:access_token",
-		"token_type":            "bearer",
-		"expires_in":            expiresIn,
-		"human_subject":         subject,
-		"actor":                 actClaim.Actor,
-		"authorization_details": rar,
-		"perm":                  perms,
-	})
+	response := map[string]any{
+		"access_token":      token,
+		"issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+		"token_type":        "bearer",
+		"expires_in":        expiresIn,
+		"human_subject":     subject,
+		"actor":             actClaim.Actor,
+		"perm":              perms,
+	}
+
+	// Only include authorization_details in response if enabled
+	if enableRAR {
+		response["authorization_details"] = rar
+	}
+
+	writeTokenResponse(w, response)
 }
 
 func (s *authorizationServer) authenticateClient(r *http.Request, grantType string) (store.Client, error) {
+	// RFC 7523: Check for JWT Bearer Client Assertion authentication
+	assertionType := r.PostFormValue("client_assertion_type")
+	assertion := r.PostFormValue("client_assertion")
+
+	if assertionType == "urn:ietf:params:oauth:client-assertion-type:jwt-bearer" && assertion != "" {
+		return s.authenticateClientWithAssertion(r, assertion, grantType)
+	}
+
+	// Standard client_secret authentication (existing flow)
 	header := r.Header.Get("Authorization")
 	var clientID, clientSecret string
 	if header != "" && strings.HasPrefix(strings.ToLower(header), "basic ") {
@@ -947,6 +1228,65 @@ func (s *authorizationServer) authenticateClient(r *http.Request, grantType stri
 			return store.Client{}, errors.New("invalid client secret")
 		}
 	}
+	return client, nil
+}
+
+// authenticateClientWithAssertion implements RFC 7523 JWT Bearer Client Assertion authentication.
+func (s *authorizationServer) authenticateClientWithAssertion(r *http.Request, assertion string, grantType string) (store.Client, error) {
+	// Build the expected audience (token endpoint URL)
+	expectedAudience := s.cfg.Issuer + "/token"
+
+	// Parse JWT to extract client_id from iss/sub claims (unauthenticated parse)
+	// We need this to look up the client's public key
+	type tempClaims struct {
+		Issuer string `json:"iss"`
+		jwt.RegisteredClaims
+	}
+	parser := jwt.NewParser()
+	token, _, err := parser.ParseUnverified(assertion, &tempClaims{})
+	if err != nil {
+		log.Printf("[RFC 7523] Failed to parse assertion: %v", err)
+		return store.Client{}, errors.New("invalid assertion format")
+	}
+
+	claims, ok := token.Claims.(*tempClaims)
+	if !ok || claims.Issuer == "" {
+		return store.Client{}, errors.New("assertion missing issuer")
+	}
+
+	clientID := claims.Issuer
+
+	// Look up client by client_id
+	client, ok, err := s.clients.GetClient(r.Context(), clientID)
+	if err != nil {
+		log.Printf("[RFC 7523] Client lookup failed for %s: %v", clientID, err)
+		return store.Client{}, errors.New("client lookup failed")
+	}
+	if !ok {
+		log.Printf("[RFC 7523] Unknown client: %s", clientID)
+		return store.Client{}, errors.New("unknown client")
+	}
+
+	// Verify client has public key registered
+	if client.PublicKey == "" {
+		log.Printf("[RFC 7523] Client %s has no public key registered", clientID)
+		return store.Client{}, errors.New("client not configured for JWT assertion authentication")
+	}
+
+	// Validate JWT assertion using client's public key
+	if err := auth.ValidateJWTAssertion(assertion, client, expectedAudience, s.jtiStore); err != nil {
+		log.Printf("[RFC 7523] Assertion validation failed for %s: %v", clientID, err)
+		return store.Client{}, fmt.Errorf("assertion validation failed: %w", err)
+	}
+
+	// Check client is authorized for requested grant type
+	normalizedGrant := store.NormalizeGrantType(grantType)
+	if normalizedGrant != "" && !clientAllowsGrant(client, normalizedGrant) {
+		log.Printf("[RFC 7523] Client %s not authorized for grant type %s", clientID, normalizedGrant)
+		return store.Client{}, errors.New("unauthorized client")
+	}
+
+	log.Printf("[RFC 7523] ✓ Client %s authenticated via JWT assertion", clientID)
 	return client, nil
 }
 
@@ -1114,8 +1454,10 @@ func ensureDir(path string) error {
 }
 
 func clientAllowsGrant(client store.Client, grantType string) bool {
+	normalizedRequested := store.NormalizeGrantType(strings.TrimSpace(grantType))
 	for _, grant := range client.GrantTypes {
-		if grant == grantType {
+		normalizedAllowed := store.NormalizeGrantType(strings.TrimSpace(grant))
+		if grant == grantType || normalizedAllowed == normalizedRequested {
 			return true
 		}
 	}
@@ -1129,6 +1471,18 @@ func redirectURIMatch(allowed []string, requested string) bool {
 		}
 	}
 	return false
+}
+
+// extractActionsFromRAR extracts all actions from RAR entries into a flat list
+func extractActionsFromRAR(rar []obo.RAR) []string {
+	if len(rar) == 0 {
+		return nil
+	}
+	var actions []string
+	for _, entry := range rar {
+		actions = append(actions, entry.Actions...)
+	}
+	return actions
 }
 
 func scopeSubsetList(requested string, allowed []string) bool {
@@ -1149,6 +1503,28 @@ func scopeSubsetList(requested string, allowed []string) bool {
 		}
 	}
 	return true
+}
+
+// intersectScopes returns the intersection of two scope lists
+// Used to compute: client.Scopes ∩ subject.scopes
+func intersectScopes(clientScopes []string, subjectScopes []string) []string {
+	if len(clientScopes) == 0 || len(subjectScopes) == 0 {
+		return []string{}
+	}
+
+	subjectSet := make(map[string]struct{}, len(subjectScopes))
+	for _, scope := range subjectScopes {
+		subjectSet[scope] = struct{}{}
+	}
+
+	intersection := []string{}
+	for _, scope := range clientScopes {
+		if _, ok := subjectSet[scope]; ok {
+			intersection = append(intersection, scope)
+		}
+	}
+
+	return intersection
 }
 
 func stringInList(list []string, value string) bool {

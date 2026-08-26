@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto"
 	"crypto/rsa"
@@ -14,15 +13,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"tokenator/internal/auth"
 	"tokenator/internal/config"
 	"tokenator/internal/identity"
 	internaljwt "tokenator/internal/jwt"
 	"tokenator/internal/obo"
 	"tokenator/internal/ratelimit"
+	"tokenator/internal/session"
 	"tokenator/internal/store"
 	memstore "tokenator/internal/store/mem"
 )
@@ -72,25 +74,7 @@ func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302, got %d", resp.StatusCode)
-	}
-	location := resp.Header.Get("Location")
-	locURL, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -103,7 +87,7 @@ func TestAuthorizationCodeFlowWithRegisteredHuman(t *testing.T) {
 		t.Fatalf("create token request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err = client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -153,12 +137,8 @@ func TestPublicClientRequiresPKCE(t *testing.T) {
 		t.Fatalf("seed public client: %v", err)
 	}
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
+	noPKCE := authorizeParams("public-client", "http://localhost/callback", "openid")
+	resp := authorizeWithConsent(t, srv, server, human, noPKCE)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 without PKCE, got %d", resp.StatusCode)
@@ -166,34 +146,20 @@ func TestPublicClientRequiresPKCE(t *testing.T) {
 
 	codeVerifier := "pkce-code-verifier-1234567890abcdef1234567890abcdef1234567"
 	challenge := pkceChallenge(codeVerifier)
-	authURL = fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s&code_challenge=%s&code_challenge_method=plain", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID), url.QueryEscape(challenge))
-	resp, err = client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
+
+	plainPKCE := authorizeParams("public-client", "http://localhost/callback", "openid")
+	plainPKCE.Set("code_challenge", challenge)
+	plainPKCE.Set("code_challenge_method", "plain")
+	resp = authorizeWithConsent(t, srv, server, human, plainPKCE)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 for plain PKCE, got %d", resp.StatusCode)
 	}
 
-	authURL = fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s&code_challenge=%s&code_challenge_method=S256", server.URL, url.QueryEscape("public-client"), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID), url.QueryEscape(challenge))
-	resp, err = client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302, got %d", resp.StatusCode)
-	}
-	location := resp.Header.Get("Location")
-	locURL, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	s256PKCE := authorizeParams("public-client", "http://localhost/callback", "openid")
+	s256PKCE.Set("code_challenge", challenge)
+	s256PKCE.Set("code_challenge_method", "S256")
+	code := authorizeCode(t, srv, server, human, s256PKCE)
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -206,7 +172,7 @@ func TestPublicClientRequiresPKCE(t *testing.T) {
 		t.Fatalf("create token request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err = client.Do(req)
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -225,27 +191,10 @@ func TestRefreshTokenRotationAndReuseDetection(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	_, server := newTestServer(t, idStore)
+	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302, got %d", resp.StatusCode)
-	}
-	locURL, err := url.Parse(resp.Header.Get("Location"))
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -258,7 +207,7 @@ func TestRefreshTokenRotationAndReuseDetection(t *testing.T) {
 		t.Fatalf("create token request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err = client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -330,27 +279,10 @@ func TestIntrospectAndRevoke(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	_, server := newTestServer(t, idStore)
+	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302, got %d", resp.StatusCode)
-	}
-	locURL, err := url.Parse(resp.Header.Get("Location"))
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -363,7 +295,7 @@ func TestIntrospectAndRevoke(t *testing.T) {
 		t.Fatalf("create token request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	resp, err = client.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -487,23 +419,7 @@ func TestTokenExchangeWithRegisteredIdentities(t *testing.T) {
 	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	subjectBody, _ := json.Marshal(map[string]string{"human_id": human.ID})
-	subjectResp, err := http.Post(server.URL+"/subject-assertion", "application/json", bytes.NewReader(subjectBody))
-	if err != nil {
-		t.Fatalf("subject assertion request: %v", err)
-	}
-	defer subjectResp.Body.Close()
-	if subjectResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 from subject assertion, got %d", subjectResp.StatusCode)
-	}
-	var subject map[string]any
-	if err := json.NewDecoder(subjectResp.Body).Decode(&subject); err != nil {
-		t.Fatalf("decode subject assertion: %v", err)
-	}
-	subjectToken, _ := subject["assertion"].(string)
-	if subjectToken == "" {
-		t.Fatal("missing subject assertion")
-	}
+	subjectToken := mintScopedAccessToken(t, srv, server, human, "orders:export")
 
 	authDetails := `[{"type":"agent-action","actions":["orders:export"],"constraints":{"resource_ids":["acct:123"]}}]`
 	form := url.Values{}
@@ -563,17 +479,9 @@ func TestTokenExchangeCapabilityDenied(t *testing.T) {
 	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	subjectBody, _ := json.Marshal(map[string]string{"human_id": human.ID})
-	subjectResp, err := http.Post(server.URL+"/subject-assertion", "application/json", bytes.NewReader(subjectBody))
-	if err != nil {
-		t.Fatalf("subject assertion request: %v", err)
-	}
-	defer subjectResp.Body.Close()
-	var subject map[string]any
-	if err := json.NewDecoder(subjectResp.Body).Decode(&subject); err != nil {
-		t.Fatalf("decode subject assertion: %v", err)
-	}
-	subjectToken, _ := subject["assertion"].(string)
+	// The human genuinely holds orders:export; the agent's capabilities do not,
+	// so the exchange must be refused on capability grounds, not scope grounds.
+	subjectToken := mintScopedAccessToken(t, srv, server, human, "orders:export")
 
 	authDetails := `[{"type":"agent-action","actions":["orders:export"]}]`
 	form := url.Values{}
@@ -639,15 +547,10 @@ func TestRedirectURIMismatch(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	_, server := newTestServer(t, idStore)
+	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/other"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
+	resp := authorizeWithConsent(t, srv, server, human, authorizeParams(testClientID, "http://localhost/other", "openid"))
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
@@ -662,25 +565,10 @@ func TestAuthorizationCodeOneTimeUse(t *testing.T) {
 		t.Fatalf("create human: %v", err)
 	}
 
-	_, server := newTestServer(t, idStore)
+	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	location := resp.Header.Get("Location")
-	locURL, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -688,7 +576,7 @@ func TestAuthorizationCodeOneTimeUse(t *testing.T) {
 	form.Set("redirect_uri", "http://localhost/callback")
 	form.Set("client_id", testClientID)
 	form.Set("client_secret", testClientSecret)
-	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -721,26 +609,12 @@ func TestAuthorizationCodeExpires(t *testing.T) {
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: time.Hour,
 		OBOTokenTTL:     time.Minute,
+		EnableRAR:       true,
 	}
-	_, server := newTestServerWithConfig(t, idStore, cfg)
+	srv, server := newTestServerWithConfig(t, idStore, cfg)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=openid&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	location := resp.Header.Get("Location")
-	locURL, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
 
 	time.Sleep(20 * time.Millisecond)
 
@@ -750,7 +624,7 @@ func TestAuthorizationCodeExpires(t *testing.T) {
 	form.Set("redirect_uri", "http://localhost/callback")
 	form.Set("client_id", testClientID)
 	form.Set("client_secret", testClientSecret)
-	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -758,6 +632,59 @@ func TestAuthorizationCodeExpires(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
 	}
+}
+
+// TestMetadataAdvertisesSupportedClientAuth guards the discovery documents
+// against drifting away from what the server actually implements: RFC 7523
+// client assertions and RFC 9449 DPoP were both shipped without ever being
+// announced, leaving conforming clients unable to discover them.
+func TestMetadataAdvertisesSupportedClientAuth(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	if _, err := idStore.CreateHuman(ctx, identity.Human{Email: "meta@example.com", Name: "Meta"}); err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	_, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	for _, path := range []string{"/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"} {
+		resp, err := http.Get(server.URL + path)
+		if err != nil {
+			t.Fatalf("%s: request: %v", path, err)
+		}
+		var metadata map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+			resp.Body.Close()
+			t.Fatalf("%s: decode: %v", path, err)
+		}
+		resp.Body.Close()
+
+		methods := toStringSlice(metadata["token_endpoint_auth_methods_supported"])
+		if !stringInList(methods, "private_key_jwt") {
+			t.Errorf("%s: expected private_key_jwt in token_endpoint_auth_methods_supported, got %v", path, methods)
+		}
+		if !stringInList(toStringSlice(metadata["token_endpoint_auth_signing_alg_values_supported"]), "RS256") {
+			t.Errorf("%s: expected RS256 among client assertion signing algs", path)
+		}
+		if !stringInList(toStringSlice(metadata["dpop_signing_alg_values_supported"]), "ES256") {
+			t.Errorf("%s: expected ES256 among DPoP signing algs", path)
+		}
+	}
+}
+
+func toStringSlice(v any) []string {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func TestJWKSAndJWTClaims(t *testing.T) {
@@ -838,22 +765,7 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 	srv, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
-	authURL := fmt.Sprintf("%s/oauth2/authorize?response_type=code&client_id=%s&redirect_uri=%s&scope=%s&human_id=%s", server.URL, url.QueryEscape(testClientID), url.QueryEscape("http://localhost/callback"), url.QueryEscape("orders:read"), url.QueryEscape(human.ID))
-	resp, err := client.Get(authURL)
-	if err != nil {
-		t.Fatalf("authorize request: %v", err)
-	}
-	defer resp.Body.Close()
-	location := resp.Header.Get("Location")
-	locURL, err := url.Parse(location)
-	if err != nil {
-		t.Fatalf("parse redirect: %v", err)
-	}
-	code := locURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("expected authorization code")
-	}
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "orders:read"))
 
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -861,7 +773,7 @@ func TestTokenExchangeScopeEscalationDenied(t *testing.T) {
 	form.Set("redirect_uri", "http://localhost/callback")
 	form.Set("client_id", testClientID)
 	form.Set("client_secret", testClientSecret)
-	resp, err = http.PostForm(server.URL+"/oauth2/token", form)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
 	if err != nil {
 		t.Fatalf("token request: %v", err)
 	}
@@ -905,8 +817,134 @@ func newTestServer(t *testing.T, identityStore identity.Store) (*authorizationSe
 		AccessTokenTTL:  time.Hour,
 		RefreshTokenTTL: time.Hour,
 		OBOTokenTTL:     time.Minute,
+		EnableRAR:       true,
 	}
 	return newTestServerWithConfig(t, identityStore, cfg)
+}
+
+// mintScopedAccessToken runs a full authorization code flow for the human and
+// returns an access token carrying scope, suitable for use as an RFC 8693
+// subject token. Token exchange validates the requested scope against the
+// subject token's scope, so the subject token must actually hold it.
+func mintScopedAccessToken(t *testing.T, srv *authorizationServer, server *httptest.Server, human identity.Human, scope string) string {
+	t.Helper()
+
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", scope))
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 minting subject token, got %d: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode token response: %v", err)
+	}
+	access, _ := tokenResp["access_token"].(string)
+	if access == "" {
+		t.Fatal("missing access token for subject token")
+	}
+	return access
+}
+
+// authorizeParams builds a standard authorization request. Identity is carried
+// by the session cookie, never by a query parameter.
+func authorizeParams(clientID, redirectURI, scope string) url.Values {
+	return url.Values{
+		"response_type": {"code"},
+		"client_id":     {clientID},
+		"redirect_uri":  {redirectURI},
+		"scope":         {scope},
+	}
+}
+
+// authorizeWithConsent drives the real end-to-end browser flow for an already
+// authenticated human: it mints a session, calls GET /oauth2/authorize with the
+// session cookie, then approves the resulting consent page via POST /consent.
+//
+// When the authorize step does not reach consent — a validation failure such as
+// a missing PKCE challenge or a mismatched redirect_uri — that response is
+// returned as-is so tests can assert on it. Otherwise the redirect produced by
+// the consent approval is returned, carrying the authorization code.
+//
+// Callers must close the returned response body.
+func authorizeWithConsent(t *testing.T, srv *authorizationServer, server *httptest.Server, human identity.Human, params url.Values) *http.Response {
+	t.Helper()
+
+	sess, err := srv.authHandler.Sessions.Create(human.ID, human.Email)
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	cookie := &http.Cookie{Name: "session_id", Value: sess.ID}
+	client := &http.Client{CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse }}
+
+	authReq, err := http.NewRequest(http.MethodGet, server.URL+"/oauth2/authorize?"+params.Encode(), nil)
+	if err != nil {
+		t.Fatalf("build authorize request: %v", err)
+	}
+	authReq.AddCookie(cookie)
+	authResp, err := client.Do(authReq)
+	if err != nil {
+		t.Fatalf("authorize request: %v", err)
+	}
+
+	// Anything other than a rendered consent page is the caller's to assert on.
+	if authResp.StatusCode != http.StatusOK {
+		return authResp
+	}
+	authResp.Body.Close()
+
+	form := url.Values{}
+	form.Set("action", "approve")
+	for _, field := range []string{"client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"} {
+		if v := params.Get(field); v != "" {
+			form.Set(field, v)
+		}
+	}
+
+	consentReq, err := http.NewRequest(http.MethodPost, server.URL+"/consent", strings.NewReader(form.Encode()))
+	if err != nil {
+		t.Fatalf("build consent request: %v", err)
+	}
+	consentReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	consentReq.AddCookie(cookie)
+	consentResp, err := client.Do(consentReq)
+	if err != nil {
+		t.Fatalf("consent request: %v", err)
+	}
+	return consentResp
+}
+
+// authorizeCode runs authorizeWithConsent and extracts the authorization code
+// from the resulting redirect, failing the test if one was not issued.
+func authorizeCode(t *testing.T, srv *authorizationServer, server *httptest.Server, human identity.Human, params url.Values) string {
+	t.Helper()
+
+	resp := authorizeWithConsent(t, srv, server, human, params)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 302 from consent, got %d: %s", resp.StatusCode, string(body))
+	}
+	locURL, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("parse redirect: %v", err)
+	}
+	code := locURL.Query().Get("code")
+	if code == "" {
+		t.Fatal("expected authorization code")
+	}
+	return code
 }
 
 func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *config.Config) (*authorizationServer, *httptest.Server) {
@@ -939,6 +977,12 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	}
 	oboService := &obo.Service{Signer: signer, Issuer: cfg.Issuer, Audience: cfg.Audience, OBOTTL: cfg.OBOTokenTTL}
 
+	sessionStore := session.NewMemoryStore(0)
+	authHandler, err := auth.NewHandlerWithTemplates(sessionStore, identityStore, cfg.DevMode, filepath.Join("..", "..", "web", "templates"))
+	if err != nil {
+		t.Fatalf("init auth handler: %v", err)
+	}
+
 	srv := &authorizationServer{
 		cfg:                cfg,
 		store:              oauthStore,
@@ -946,6 +990,7 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 		signer:             signer,
 		oboService:         oboService,
 		identities:         identityStore,
+		authHandler:        authHandler,
 		allowLegacy:        false,
 		legacyUsers:        map[string]string{},
 		legacyDefaultHuman: "",
@@ -954,9 +999,14 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	identityHandler := identity.NewHandler(identityStore, cfg.AdminToken)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/jwks.json", methodHandler(http.MethodGet, srv.handleJWKS))
-	mux.HandleFunc("/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
+	mux.HandleFunc("/.well-known/oauth-authorization-server", methodHandler(http.MethodGet, srv.handleAuthorizationServerMetadata))
+	mux.HandleFunc("/.well-known/openid-configuration", methodHandler(http.MethodGet, srv.handleOpenIDConfiguration))
+	// Mirror production routing: /authorize and /consent sit behind RequireAuth so
+	// tests exercise the real session + consent path rather than a relaxed handler.
+	mux.Handle("/authorize", authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize)))
 	mux.HandleFunc("/token", methodHandler(http.MethodPost, srv.handleToken))
-	mux.HandleFunc("/oauth2/authorize", methodHandler(http.MethodGet, srv.handleAuthorize))
+	mux.Handle("/oauth2/authorize", authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize)))
+	mux.Handle("/consent", authHandler.RequireAuth(methodHandler(http.MethodPost, srv.handleConsent)))
 	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
 	mux.HandleFunc("/oauth2/introspect", methodHandler(http.MethodPost, srv.handleIntrospect))
 	mux.HandleFunc("/oauth2/revoke", methodHandler(http.MethodPost, srv.handleRevoke))
