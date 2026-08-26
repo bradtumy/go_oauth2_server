@@ -22,6 +22,7 @@ import (
 	"tokenator/internal/admin"
 	"tokenator/internal/auth"
 	"tokenator/internal/config"
+	"tokenator/internal/federation"
 	"tokenator/internal/identity"
 	internaljwt "tokenator/internal/jwt"
 	"tokenator/internal/obo"
@@ -68,6 +69,8 @@ func main() {
 	// Start session cleanup worker (runs every 15 minutes)
 	authHandler.StartCleanupWorker(15 * time.Minute)
 	log.Printf("Session cleanup worker started (interval: 15m, idle timeout: 30m)")
+
+	configureFederation(authHandler, cfg)
 
 	signer, err := buildSigner(cfg)
 	if err != nil {
@@ -121,6 +124,11 @@ func main() {
 		}
 	})
 	mux.HandleFunc("/logout", authHandler.HandleLogout)
+
+	// Federated sign-in. Both handlers 404 when no upstream provider is
+	// configured, so the routes are inert rather than half-working.
+	mux.Handle("/auth/sso/login", methodHandler(http.MethodGet, authHandler.HandleSSOStart))
+	mux.Handle("/auth/sso/callback", methodHandler(http.MethodGet, authHandler.HandleSSOCallback))
 	mux.Handle("/consent", authHandler.RequireAuth(methodHandler(http.MethodPost, srv.handleConsent)))
 
 	// OAuth routes with authentication required
@@ -306,6 +314,42 @@ func (s *authorizationServer) resolveAgent(ctx context.Context, clientID, reques
 		return identity.Agent{}, errAgentAmbiguous
 	}
 	return agents[0], nil
+}
+
+// configureFederation attaches an upstream OIDC provider when one is configured.
+//
+// Discovery is a network call to a third party, so failure here is deliberately
+// not fatal: an unreachable provider must not stop the authorization server
+// from booting and serving password logins. A failure leaves federation off and
+// is reported loudly.
+func configureFederation(authHandler *auth.Handler, cfg *config.Config) {
+	fedCfg := federation.Config{
+		Issuer:       cfg.UpstreamIssuer,
+		ClientID:     cfg.UpstreamClientID,
+		ClientSecret: cfg.UpstreamClientSecret,
+		RedirectURL:  cfg.UpstreamRedirectURL(),
+		Scopes:       cfg.UpstreamScopes,
+		DisplayName:  cfg.UpstreamDisplayName,
+	}
+	if !fedCfg.Enabled() {
+		log.Printf("Federated sign-in disabled (set UPSTREAM_ISSUER, UPSTREAM_CLIENT_ID and UPSTREAM_CLIENT_SECRET to enable)")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	provider, err := federation.New(ctx, fedCfg)
+	if err != nil {
+		log.Printf("WARNING: federated sign-in unavailable, continuing with password login only: %v", err)
+		return
+	}
+
+	authHandler.SetFederation(provider)
+	// The redirect URI must match the provider's registration exactly, and a
+	// mismatch is the most common setup failure, so state it plainly at boot.
+	log.Printf("Federated sign-in enabled: issuer=%s provider=%s redirect_uri=%s",
+		cfg.UpstreamIssuer, provider.DisplayName(), provider.RedirectURL())
 }
 
 func (s *authorizationServer) handleJWKS(w http.ResponseWriter, r *http.Request) {

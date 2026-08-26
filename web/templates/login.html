@@ -162,23 +162,28 @@
             right: 0;
         }
         
-        .register-link {
-            text-align: center;
-            margin-top: 24px;
-            color: #6b7280;
-            font-size: 14px;
-        }
-        
-        .register-link a {
-            color: #667eea;
-            text-decoration: none;
+        .btn-sso {
+            display: block;
+            width: 100%;
+            box-sizing: border-box;
+            padding: 14px;
+            background: #ffffff;
+            color: #1f2937;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            font-size: 16px;
             font-weight: 600;
+            text-align: center;
+            text-decoration: none;
+            cursor: pointer;
+            transition: background 0.2s, border-color 0.2s;
         }
-        
-        .register-link a:hover {
-            text-decoration: underline;
+
+        .btn-sso:hover {
+            background: #f9fafb;
+            border-color: #9ca3af;
         }
-        
+
         .info-box {
             background: #eff6ff;
             border: 1px solid #bfdbfe;
@@ -208,6 +213,11 @@
         </div>
         {{end}}
         
+        {{if .SSOEnabled}}
+        <a href="{{.SSOStartURL}}" class="btn-sso">Sign in with {{.SSOName}}</a>
+        <div class="divider">or</div>
+        {{end}}
+
         <form method="POST" action="/login">
             <input type="hidden" name="return_to" value="{{.ReturnTo}}">
             <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
@@ -237,9 +247,8 @@
                     <input type="checkbox" name="remember_me" value="1">
                     Remember me
                 </label>
-                <a href="/auth/forgot-password" class="forgot-password">Forgot password?</a>
             </div>
-            
+
             <button type="submit" class="btn-login">
                 Sign In
             </button>

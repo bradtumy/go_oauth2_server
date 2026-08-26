@@ -7,11 +7,14 @@ import (
 )
 
 var (
-	ErrHumanNotFound     = errors.New("human not found")
-	ErrAgentNotFound     = errors.New("agent not found")
-	ErrHumanEmailExists  = errors.New("human email already exists")
-	ErrAgentLabelExists  = errors.New("agent label already exists for client")
-	ErrInvalidPagination = errors.New("invalid pagination parameters")
+	ErrHumanNotFound    = errors.New("human not found")
+	ErrAgentNotFound    = errors.New("agent not found")
+	ErrHumanEmailExists = errors.New("human email already exists")
+	// ErrFederatedSubjectLinked is returned when an upstream subject is already
+	// linked to a different human.
+	ErrFederatedSubjectLinked = errors.New("federated subject already linked to another human")
+	ErrAgentLabelExists       = errors.New("agent label already exists for client")
+	ErrInvalidPagination      = errors.New("invalid pagination parameters")
 )
 
 type Human struct {
@@ -21,7 +24,11 @@ type Human struct {
 	PasswordHash string            `json:"-"` // Bcrypt hash, never expose in JSON
 	TenantID     string            `json:"tenant_id"`
 	Attributes   map[string]string `json:"attributes,omitempty"`
-	CreatedAt    time.Time         `json:"created_at"`
+	// FederatedSubject is the provider-qualified subject of an upstream OIDC
+	// identity linked to this human, e.g. "google:1234567890". It is an internal
+	// correlator and is never exposed through the identity API.
+	FederatedSubject string    `json:"-"`
+	CreatedAt        time.Time `json:"created_at"`
 }
 
 type Agent struct {
@@ -41,6 +48,11 @@ type Store interface {
 	CreateHuman(ctx context.Context, input Human) (Human, error)
 	GetHuman(ctx context.Context, id string) (Human, bool)
 	GetHumanByEmail(ctx context.Context, email string) (Human, bool)
+	// GetHumanByFederatedSubject looks a human up by provider-qualified upstream
+	// subject, e.g. "google:1234567890".
+	GetHumanByFederatedSubject(ctx context.Context, subject string) (Human, bool)
+	// LinkFederatedSubject attaches an upstream subject to an existing human.
+	LinkFederatedSubject(ctx context.Context, humanID, subject string) (Human, error)
 	ListHumans(ctx context.Context, limit, offset int) ([]Human, error)
 	DeleteHuman(ctx context.Context, id string) error
 

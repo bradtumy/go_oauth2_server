@@ -21,6 +21,7 @@ type Store struct {
 	humans          map[string]identity.Human
 	agents          map[string]identity.Agent
 	emailIndex      map[string]string
+	federatedIndex  map[string]string
 	agentLabelIndex map[string]string
 	agentsByClient  map[string]map[string]struct{}
 }
@@ -30,6 +31,7 @@ func New() *Store {
 		humans:          make(map[string]identity.Human),
 		agents:          make(map[string]identity.Agent),
 		emailIndex:      make(map[string]string),
+		federatedIndex:  make(map[string]string),
 		agentLabelIndex: make(map[string]string),
 		agentsByClient:  make(map[string]map[string]struct{}),
 	}
@@ -59,7 +61,59 @@ func (s *Store) CreateHuman(ctx context.Context, input identity.Human) (identity
 	}
 	s.humans[input.ID] = input
 	s.emailIndex[emailKey] = input.ID
+	if subject := strings.TrimSpace(input.FederatedSubject); subject != "" {
+		s.federatedIndex[subject] = input.ID
+	}
 	return input, nil
+}
+
+// GetHumanByFederatedSubject resolves a human from a provider-qualified upstream
+// subject such as "google:1234567890".
+func (s *Store) GetHumanByFederatedSubject(ctx context.Context, subject string) (identity.Human, bool) {
+	if err := ctx.Err(); err != nil {
+		return identity.Human{}, false
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return identity.Human{}, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.federatedIndex[subject]
+	if !ok {
+		return identity.Human{}, false
+	}
+	human, ok := s.humans[id]
+	return human, ok
+}
+
+// LinkFederatedSubject attaches an upstream subject to an existing human. It is
+// an error to link a subject that is already bound to a different human, which
+// keeps the mapping one-to-one.
+func (s *Store) LinkFederatedSubject(ctx context.Context, humanID, subject string) (identity.Human, error) {
+	if err := ctx.Err(); err != nil {
+		return identity.Human{}, err
+	}
+	subject = strings.TrimSpace(subject)
+	if subject == "" {
+		return identity.Human{}, fmt.Errorf("federated subject required")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	human, ok := s.humans[humanID]
+	if !ok {
+		return identity.Human{}, identity.ErrHumanNotFound
+	}
+	if existing, taken := s.federatedIndex[subject]; taken && existing != humanID {
+		return identity.Human{}, identity.ErrFederatedSubjectLinked
+	}
+	if prior := strings.TrimSpace(human.FederatedSubject); prior != "" && prior != subject {
+		delete(s.federatedIndex, prior)
+	}
+	human.FederatedSubject = subject
+	s.humans[humanID] = human
+	s.federatedIndex[subject] = humanID
+	return human, nil
 }
 
 func (s *Store) GetHuman(ctx context.Context, id string) (identity.Human, bool) {
@@ -139,6 +193,9 @@ func (s *Store) DeleteHuman(ctx context.Context, id string) error {
 	}
 	delete(s.humans, id)
 	delete(s.emailIndex, normalizeEmail(h.Email))
+	if subject := strings.TrimSpace(h.FederatedSubject); subject != "" {
+		delete(s.federatedIndex, subject)
+	}
 	return nil
 }
 

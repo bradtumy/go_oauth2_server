@@ -20,6 +20,7 @@ type Handler struct {
 	Identities identity.Store
 	DevMode    bool
 	templates  *template.Template
+	federation FederatedProvider
 }
 
 // NewHandler creates a new authentication handler, loading templates from the
@@ -49,10 +50,13 @@ func (h *Handler) ShowLogin(w http.ResponseWriter, r *http.Request) {
 	returnTo := r.URL.Query().Get("return_to")
 
 	data := map[string]interface{}{
-		"ReturnTo":  returnTo,
-		"CSRFToken": "temp-csrf", // TODO: Implement proper CSRF
-		"Error":     r.URL.Query().Get("error"),
-		"DevMode":   h.DevMode,
+		"ReturnTo":    returnTo,
+		"CSRFToken":   "temp-csrf", // TODO: Implement proper CSRF
+		"Error":       r.URL.Query().Get("error"),
+		"DevMode":     h.DevMode,
+		"SSOEnabled":  h.FederationEnabled(),
+		"SSOName":     h.FederationDisplayName(),
+		"SSOStartURL": "/auth/sso/login?return_to=" + url.QueryEscape(returnTo),
 	}
 
 	if err := h.templates.ExecuteTemplate(w, "login.html", data); err != nil {
@@ -110,22 +114,24 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set session cookie
+	h.setSessionCookie(w, sess.ID)
+
+	// Redirect to return_to or default to root
+	http.Redirect(w, r, safeReturnTo(returnTo), http.StatusSeeOther)
+}
+
+// setSessionCookie issues the session cookie. Both the password and the
+// federated sign-in paths use it so the cookie's attributes are defined once.
+func (h *Handler) setSessionCookie(w http.ResponseWriter, sessionID string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
-		Value:    sess.ID,
+		Value:    sessionID,
 		Path:     "/",
 		MaxAge:   int(session.DefaultAbsoluteTimeout.Seconds()),
 		HttpOnly: true,
 		Secure:   false, // Set to true in production with HTTPS
 		SameSite: http.SameSiteLaxMode,
 	})
-
-	// Redirect to return_to or default to root
-	if returnTo == "" {
-		returnTo = "/"
-	}
-	http.Redirect(w, r, returnTo, http.StatusSeeOther)
 }
 
 // HandleLogout logs out the user

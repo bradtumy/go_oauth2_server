@@ -16,6 +16,14 @@ services:
       - AS_ADMIN_ADDR=127.0.0.1:8082
       - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
       - AS_SIGNING_KEY_ID=dev-rs256
+      # Federated sign-in. Values come from .env (gitignored) via compose
+      # interpolation; leaving them unset simply disables the feature.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:8080}
+      - UPSTREAM_ISSUER=${UPSTREAM_ISSUER:-}
+      - UPSTREAM_CLIENT_ID=${UPSTREAM_CLIENT_ID:-}
+      - UPSTREAM_CLIENT_SECRET=${UPSTREAM_CLIENT_SECRET:-}
+      - UPSTREAM_SCOPES=${UPSTREAM_SCOPES:-openid,email,profile}
+      - UPSTREAM_DISPLAY_NAME=${UPSTREAM_DISPLAY_NAME:-Google}
     volumes:
       - ./data:/data
       - ./seed:/seed:ro

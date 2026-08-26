@@ -40,6 +40,26 @@ type Config struct {
 	IntrospectRateLimitBurst   int
 	AdminRateLimitRPS          int
 	AdminRateLimitBurst        int
+
+	// Upstream OIDC provider used for federated human sign-in. Federation is
+	// enabled only when issuer, client ID and client secret are all present.
+	UpstreamIssuer       string
+	UpstreamClientID     string
+	UpstreamClientSecret string
+	UpstreamScopes       []string
+	UpstreamDisplayName  string
+	PublicBaseURL        string
+}
+
+// UpstreamRedirectURL is the callback the upstream provider must be configured
+// to redirect to. The path is provider-neutral because the provider itself is
+// configurable.
+func (c *Config) UpstreamRedirectURL() string {
+	base := strings.TrimRight(strings.TrimSpace(c.PublicBaseURL), "/")
+	if base == "" {
+		base = strings.TrimRight(strings.TrimSpace(c.Issuer), "/")
+	}
+	return base + "/auth/sso/callback"
 }
 
 const (
@@ -163,6 +183,13 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	cfg.EnableRAR = enableRAR
+
+	cfg.UpstreamIssuer = strings.TrimSpace(getEnv("UPSTREAM_ISSUER", ""))
+	cfg.UpstreamClientID = strings.TrimSpace(getEnv("UPSTREAM_CLIENT_ID", ""))
+	cfg.UpstreamClientSecret = strings.TrimSpace(getEnv("UPSTREAM_CLIENT_SECRET", ""))
+	cfg.UpstreamDisplayName = firstNonEmpty(getEnv("UPSTREAM_DISPLAY_NAME", ""), "SSO")
+	cfg.PublicBaseURL = strings.TrimSpace(getEnv("PUBLIC_BASE_URL", ""))
+	cfg.UpstreamScopes = splitAndTrim(getEnv("UPSTREAM_SCOPES", "openid,email,profile"))
 
 	authorizeRPS, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_RPS", defaultAuthorizeRPS)
 	if err != nil {
@@ -290,6 +317,18 @@ func parseIntAllowZero(env string, fallback int) (int, error) {
 		return 0, fmt.Errorf("%s must be non-negative", env)
 	}
 	return val, nil
+}
+
+// splitAndTrim parses a comma-separated env value into non-empty entries.
+func splitAndTrim(value string) []string {
+	parts := strings.Split(value, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 func firstNonEmpty(values ...string) string {
