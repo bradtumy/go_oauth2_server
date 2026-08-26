@@ -205,12 +205,9 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Refresh Token: %s", tokens.RefreshToken)
 	}
 
-	// Decode the access token to show its contents
+	// Decode the access token to show its contents. The refresh token is
+	// deliberately not decoded: it is an opaque handle, not a JWT.
 	accessTokenClaims := decodeJWT(tokens.AccessToken)
-	refreshTokenClaims := ""
-	if tokens.RefreshToken != "" {
-		refreshTokenClaims = decodeJWT(tokens.RefreshToken)
-	}
 
 	// Test the token by calling the Resource Server
 	rsResponse, rsStatus := callResourceServer(tokens.AccessToken)
@@ -219,12 +216,12 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 	refreshTokenHTML := ""
 	if tokens.RefreshToken != "" {
 		refreshTokenHTML = fmt.Sprintf(`
-                <div class="label">Refresh Token (JWT):</div>
+                <div class="label">Refresh Token (opaque handle):</div>
                 <div class="token-box">%s</div>
-                <div class="metadata">Use this to obtain new access tokens without re-authenticating</div>
-                
-                <div class="label">Refresh Token Claims:</div>
-                <div class="token-box json-box">%s</div>`, tokens.RefreshToken, refreshTokenClaims)
+                <div class="metadata">Use this to obtain new access tokens without re-authenticating.
+                Unlike the access token, it is not a JWT and carries no claims: it is a random
+                identifier the authorization server stores and looks up, which is what lets it be
+                revoked and lets replay of a rotated token be detected.</div>`, tokens.RefreshToken)
 	}
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
