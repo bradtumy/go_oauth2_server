@@ -22,10 +22,16 @@ type Handler struct {
 	templates  *template.Template
 }
 
-// NewHandler creates a new authentication handler
+// NewHandler creates a new authentication handler, loading templates from the
+// web/templates directory relative to the process working directory.
 func NewHandler(sessions session.Store, identities identity.Store, devMode bool) (*Handler, error) {
-	// Load templates from web/templates directory
-	tmpl, err := template.ParseGlob(filepath.Join("web", "templates", "*.html"))
+	return NewHandlerWithTemplates(sessions, identities, devMode, filepath.Join("web", "templates"))
+}
+
+// NewHandlerWithTemplates is NewHandler with an explicit template directory, for
+// callers that do not run from the repository root (tests, alternate layouts).
+func NewHandlerWithTemplates(sessions session.Store, identities identity.Store, devMode bool, templateDir string) (*Handler, error) {
+	tmpl, err := template.ParseGlob(filepath.Join(templateDir, "*.html"))
 	if err != nil {
 		return nil, err
 	}

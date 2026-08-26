@@ -317,6 +317,14 @@ func (s *authorizationServer) handleJWKS(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, jwks)
 }
 
+// clientAssertionAlgValues are the algorithms accepted for RFC 7523 private_key_jwt
+// client assertions, matching the key types auth.ValidatePublicKey will parse.
+var clientAssertionAlgValues = []string{"RS256", "RS384", "RS512", "ES256", "ES384", "ES512"}
+
+// dpopAlgValues are the algorithms accepted on RFC 9449 DPoP proofs. Proof keys
+// arrive as a JWK in the header, so both RSA and EC signatures are verifiable.
+var dpopAlgValues = []string{"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512"}
+
 func (s *authorizationServer) handleAuthorizationServerMetadata(w http.ResponseWriter, r *http.Request) {
 	issuer := strings.TrimSpace(s.cfg.MetadataIssuer)
 	if issuer == "" {
@@ -333,9 +341,11 @@ func (s *authorizationServer) handleAuthorizationServerMetadata(w http.ResponseW
 		"revocation_endpoint":                   issuer + "/oauth2/revoke",
 		"response_types_supported":              []string{"code"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		"code_challenge_methods_supported":      []string{"S256"},
-		"scopes_supported":                      []string{"openid", "orders:read", "orders:export"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "private_key_jwt", "none"},
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionAlgValues,
+		"dpop_signing_alg_values_supported":                dpopAlgValues,
+		"code_challenge_methods_supported":                 []string{"S256"},
+		"scopes_supported":                                 []string{"openid", "orders:read", "orders:export"},
 	}
 
 	writeJSON(w, http.StatusOK, metadata)
@@ -358,8 +368,10 @@ func (s *authorizationServer) handleOpenIDConfiguration(w http.ResponseWriter, r
 		"subject_types_supported":               []string{"public"},
 		"id_token_signing_alg_values_supported": []string{"RS256"},
 		"scopes_supported":                      []string{"openid", "orders:read", "orders:export"},
-		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "none"},
-		"code_challenge_methods_supported":      []string{"S256"},
+		"token_endpoint_auth_methods_supported": []string{"client_secret_basic", "client_secret_post", "private_key_jwt", "none"},
+		"token_endpoint_auth_signing_alg_values_supported": clientAssertionAlgValues,
+		"dpop_signing_alg_values_supported":                dpopAlgValues,
+		"code_challenge_methods_supported":                 []string{"S256"},
 	}
 
 	writeJSON(w, http.StatusOK, metadata)
@@ -1110,9 +1122,14 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 	}
 	subjectScopes := strings.Fields(subjectScope)
 
-	// Compute intersection: client.Scopes ∩ subject.scopes
-	// This is the maximum set of scopes the agent can be granted
+	// Compute intersection: client.Scopes ∩ subject.scopes ∩ agent.Capabilities.
+	// This is the maximum set of scopes the agent can be granted. The agent's own
+	// capabilities are part of the intersection: without them any agent
+	// registered to a client could exercise that client's entire scope set,
+	// ignoring the per-agent restrictions capabilities exist to express.
+	// An agent registered with no capabilities is therefore granted nothing.
 	allowedScopes := intersectScopes(client.Scopes, subjectScopes)
+	allowedScopes = intersectScopes(allowedScopes, agent.Capabilities)
 
 	// Pass the allowed scope intersection to ComputePerms
 	// ComputePerms will further filter based on requested scopes/actions

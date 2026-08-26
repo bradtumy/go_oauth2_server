@@ -13,3 +13,8 @@ data/
 # Test outputs and temporary files
 *.log
 .DS_Store
+
+# Compiled helper binaries (build with `go build ./tools/...` instead)
+/tools/mint_dpop_proof/mint_dpop_proof
+/tools/mint_rfc7523_assertion/mint_rfc7523_assertion
+/tools/mint_assertion/mint_assertion

@@ -6,7 +6,7 @@ RUN go mod download
 RUN apk add --no-cache gcc musl-dev sqlite sqlite-dev
 COPY . .
 RUN CGO_ENABLED=1 go build -o /bin/as ./cmd/as
-RUN CGO_ENABLED=1 go build -o /bin/rs ./cmd/rs || true
+RUN CGO_ENABLED=1 go build -o /bin/rs ./cmd/rs
 
 FROM alpine:latest
 RUN apk add --no-cache ca-certificates sqlite
