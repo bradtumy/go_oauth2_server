@@ -95,10 +95,10 @@ func main() {
 	// Create DPoP proof claims
 	now := time.Now().Unix()
 	claims := map[string]any{
-		"jti": random.NewID(),                  // Unique identifier
-		"htm": *httpMethod,                     // HTTP method
-		"htu": normalizeURL(*httpURL),          // HTTP URL (without query/fragment)
-		"iat": now,                             // Issued at
+		"jti": random.NewID(),         // Unique identifier
+		"htm": *httpMethod,            // HTTP method
+		"htu": normalizeURL(*httpURL), // HTTP URL (without query/fragment)
+		"iat": now,                    // Issued at
 	}
 
 	// Add access token hash (ath) if provided (for resource server requests)

@@ -26,10 +26,10 @@ var (
 
 // DPoPClaims represents the claims in a DPoP proof JWT (RFC 9449).
 type DPoPClaims struct {
-	JTI string `json:"jti"` // Unique identifier (required)
-	HTM string `json:"htm"` // HTTP method (required)
-	HTU string `json:"htu"` // HTTP URL without query/fragment (required)
-	IAT int64  `json:"iat"` // Issued at timestamp (required)
+	JTI string `json:"jti"`           // Unique identifier (required)
+	HTM string `json:"htm"`           // HTTP method (required)
+	HTU string `json:"htu"`           // HTTP URL without query/fragment (required)
+	IAT int64  `json:"iat"`           // Issued at timestamp (required)
 	ATH string `json:"ath,omitempty"` // Access token hash (for resource server requests)
 	jwt.RegisteredClaims
 }

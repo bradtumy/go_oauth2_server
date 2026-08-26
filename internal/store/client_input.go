@@ -20,9 +20,9 @@ type ClientInput struct {
 	Scopes       []string `json:"scopes"`
 	Audiences    []string `json:"audiences"`
 	// RFC 7523: JWT Bearer Client Assertions support
-	PublicKey    string   `json:"public_key"`
-	KeyAlgorithm string   `json:"key_algorithm"`
-	KeyID        string   `json:"key_id"`
+	PublicKey    string `json:"public_key"`
+	KeyAlgorithm string `json:"key_algorithm"`
+	KeyID        string `json:"key_id"`
 }
 
 func ValidateClientInput(input ClientInput) (ClientInput, error) {
