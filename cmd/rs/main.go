@@ -43,24 +43,7 @@ func main() {
 		signer: signer,
 	}
 
-	// Setup routes with middleware composition
-	mux := http.NewServeMux()
-
-	// Health check endpoint (no auth required)
-	mux.HandleFunc("/healthz", methodHandler(http.MethodGet, rs.handleHealthz))
-	mux.HandleFunc("/.well-known/oauth-protected-resource", methodHandler(http.MethodGet, rs.handleProtectedResourceMetadata))
-
-	// Orders context: /orders/{account}/fields (requires orders.read or orders.write scope)
-	mux.Handle("/orders/",
-		rs.authMiddleware(
-			rs.scopeMiddleware([]string{"orders.read", "orders.write"},
-				methodHandler(http.MethodGet, rs.handleOrdersContext))))
-
-	// Accounts context: /accounts/{account}/orders/{action} (requires tickets.read or tickets.write scope)
-	mux.Handle("/accounts/",
-		rs.authMiddleware(
-			rs.scopeMiddleware([]string{"orders.read", "orders.write"},
-				methodHandler(http.MethodGet, rs.handleAccountsContext))))
+	mux := rs.routes()
 
 	addr := ":9090"
 	if v := os.Getenv("RS_LISTEN_ADDR"); v != "" {
@@ -240,6 +223,40 @@ func (s *resourceServer) authMiddleware(next http.Handler) http.Handler {
 }
 
 // scopeMiddleware checks if the token has required scopes
+// ordersScopes and ticketsScopes are the scopes each protected context accepts.
+// They are named rather than written inline because the two route registrations
+// are otherwise near-identical, and a copy-paste once left /accounts/ demanding
+// the orders scopes its own documentation said it did not need.
+var (
+	ordersScopes  = []string{"orders.read", "orders.write"}
+	ticketsScopes = []string{"tickets.read", "tickets.write"}
+)
+
+// routes builds the resource server's handler. Kept separate from main so the
+// wiring itself — which middleware guards which path, with which scopes — can
+// be tested rather than only the pieces it composes.
+func (s *resourceServer) routes() *http.ServeMux {
+	mux := http.NewServeMux()
+
+	// Health check endpoint (no auth required)
+	mux.HandleFunc("/healthz", methodHandler(http.MethodGet, s.handleHealthz))
+	mux.HandleFunc("/.well-known/oauth-protected-resource", methodHandler(http.MethodGet, s.handleProtectedResourceMetadata))
+
+	// Orders context: /orders/{account}/fields
+	mux.Handle("/orders/",
+		s.authMiddleware(
+			s.scopeMiddleware(ordersScopes,
+				methodHandler(http.MethodGet, s.handleOrdersContext))))
+
+	// Accounts context: /accounts/{account}/orders/{action}
+	mux.Handle("/accounts/",
+		s.authMiddleware(
+			s.scopeMiddleware(ticketsScopes,
+				methodHandler(http.MethodGet, s.handleAccountsContext))))
+
+	return mux
+}
+
 func (s *resourceServer) scopeMiddleware(requiredScopes []string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[SCOPE] → Checking authorization: required_scopes=%v", requiredScopes)
