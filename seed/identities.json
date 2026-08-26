@@ -1,0 +1,34 @@
+{
+  "humans": [
+    {
+      "email": "alice@example.com",
+      "name": "Alice Anderson",
+      "tenant_id": "demo",
+      "password": "tokenator-demo",
+      "attributes": { "role": "manager" }
+    },
+    {
+      "email": "bob@example.com",
+      "name": "Bob Brown",
+      "tenant_id": "demo",
+      "password": "tokenator-demo",
+      "attributes": { "role": "analyst" }
+    },
+    {
+      "email": "carol@example.com",
+      "name": "Carol Chen",
+      "tenant_id": "demo",
+      "password": "tokenator-demo",
+      "attributes": { "role": "auditor" }
+    }
+  ],
+  "agents": [
+    {
+      "agent_id": "agent-cli",
+      "name": "Agent CLI",
+      "client_id": "agent-cli",
+      "capabilities": ["orders.read", "orders.write", "tickets.read"],
+      "tenant_id": "demo"
+    }
+  ]
+}

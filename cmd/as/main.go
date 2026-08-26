@@ -1629,6 +1629,7 @@ func seedIdentities(ctx context.Context, store identity.Store, path string) erro
 			Email      string            `json:"email"`
 			Name       string            `json:"name"`
 			TenantID   string            `json:"tenant_id"`
+			Password   string            `json:"password"`
 			Attributes map[string]string `json:"attributes"`
 		} `json:"humans"`
 		Agents []struct {
@@ -1663,6 +1664,15 @@ func seedIdentities(ctx context.Context, store identity.Store, path string) erro
 			Name:       input.Name,
 			TenantID:   input.TenantID,
 			Attributes: input.Attributes,
+		}
+		// Without a password hash a seeded human can only sign in when DEV_MODE
+		// is on, so seeds that carry one stay usable with dev mode off.
+		if raw.Password != "" {
+			hash, err := auth.HashPassword(raw.Password)
+			if err != nil {
+				return fmt.Errorf("seed human %s: hash password: %w", human.Email, err)
+			}
+			human.PasswordHash = hash
 		}
 		if _, err := store.CreateHuman(ctx, human); err != nil {
 			if errors.Is(err, identity.ErrHumanEmailExists) {

@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -1077,4 +1078,50 @@ func verifyWithJWKS(token string, jwk map[string]any) (map[string]any, error) {
 func pkceChallenge(verifier string) string {
 	digest := sha256.Sum256([]byte(verifier))
 	return base64.RawURLEncoding.EncodeToString(digest[:])
+}
+
+// TestSeedIdentitiesHashesPasswords covers the seeded-login path: identities are
+// held in memory and reseeded on every boot, and a seeded human without a
+// password hash can only sign in when DEV_MODE is on. Seeds carrying a password
+// must therefore land as a verifiable bcrypt hash, never as plaintext.
+func TestSeedIdentitiesHashesPasswords(t *testing.T) {
+	seed := `{"humans":[
+		{"email":"seeded@example.com","name":"Seeded","password":"s3cr3t-pass"},
+		{"email":"nopass@example.com","name":"No Pass"}
+	]}`
+	path := filepath.Join(t.TempDir(), "identities.json")
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatalf("write seed: %v", err)
+	}
+
+	ctx := context.Background()
+	idStore := memstore.New()
+	if err := seedIdentities(ctx, idStore, path); err != nil {
+		t.Fatalf("seed identities: %v", err)
+	}
+
+	withPass, ok := idStore.GetHumanByEmail(ctx, "seeded@example.com")
+	if !ok {
+		t.Fatal("seeded human not found")
+	}
+	if withPass.PasswordHash == "" {
+		t.Fatal("expected a password hash for a seeded human with a password")
+	}
+	if withPass.PasswordHash == "s3cr3t-pass" {
+		t.Fatal("password was stored in plaintext")
+	}
+	if err := auth.VerifyPassword(withPass.PasswordHash, "s3cr3t-pass"); err != nil {
+		t.Fatalf("seeded password does not verify: %v", err)
+	}
+	if err := auth.VerifyPassword(withPass.PasswordHash, "wrong"); err == nil {
+		t.Fatal("expected wrong password to fail verification")
+	}
+
+	noPass, ok := idStore.GetHumanByEmail(ctx, "nopass@example.com")
+	if !ok {
+		t.Fatal("passwordless seeded human not found")
+	}
+	if noPass.PasswordHash != "" {
+		t.Fatal("expected no password hash when the seed omits one")
+	}
 }

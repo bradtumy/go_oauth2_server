@@ -9,13 +9,16 @@ services:
       - RS_AUDIENCE=http://localhost:9090
       - AS_ADMIN_TOKEN=
       - ALLOW_LEGACY_HARDCODED=false
-      - SEED_IDENTITIES_JSON=
+      # Identities live in memory and are lost on restart, so seed known demo
+      # humans (and their passwords) on every boot.
+      - SEED_IDENTITIES_JSON=/seed/identities.json
       - AS_CLIENTS_DB=/data/clients.db
       - AS_ADMIN_ADDR=127.0.0.1:8082
       - AS_SIGNING_KEY_BASE64=ZGV2LXNpZ25pbmcta2V5LTEyMzQ=
       - AS_SIGNING_KEY_ID=dev-rs256
     volumes:
       - ./data:/data
+      - ./seed:/seed:ro
     ports:
       - "8080:8080"
   rs:
