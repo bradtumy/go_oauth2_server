@@ -24,6 +24,10 @@ services:
       - UPSTREAM_CLIENT_SECRET=${UPSTREAM_CLIENT_SECRET:-}
       - UPSTREAM_SCOPES=${UPSTREAM_SCOPES:-openid,email,profile}
       - UPSTREAM_DISPLAY_NAME=${UPSTREAM_DISPLAY_NAME:-Google}
+      # TAT IdP mode. Unset TAT_TENANT_HOST leaves /tat/* disabled (412).
+      - TAT_ISSUER=${TAT_ISSUER:-}
+      - TAT_TENANT_HOST=${TAT_TENANT_HOST:-}
+      - TAT_TOKEN_TTL_SECONDS=${TAT_TOKEN_TTL_SECONDS:-300}
     volumes:
       - ./data:/data
       - ./seed:/seed:ro

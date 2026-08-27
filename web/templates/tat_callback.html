@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Signing in&hellip;</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+        }
+    </style>
+</head>
+<body onload="document.forms[0].submit()">
+    <p>Signing you in&hellip;</p>
+    <form method="POST" action="{{.CallbackURL}}">
+        <input type="hidden" name="token" value="{{.Token}}">
+        {{range .Passthrough}}<input type="hidden" name="{{.Key}}" value="{{.Value}}">
+        {{end}}
+    </form>
+</body>
+</html>

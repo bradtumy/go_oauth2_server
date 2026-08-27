@@ -190,6 +190,69 @@ func (s *Signer) issue(ctx context.Context, subject, clientID, scope string, per
 	return tokenUnsigned + "." + base64.RawURLEncoding.EncodeToString(sig), int(ttl.Seconds()), nil
 }
 
+// IssueRaw signs an arbitrary claims map as-is, filling in iat/jti only if absent.
+// Unlike issue(), it does not force iss/aud to the Signer's configured values —
+// used for minting tokens on behalf of a foreign issuer/audience pair (e.g.
+// emulating an external Trusted Auth Token IdP against a third-party tenant).
+func (s *Signer) IssueRaw(claims MapClaims) (string, error) {
+	now := time.Now().UTC()
+	out := make(MapClaims, len(claims))
+	for k, v := range claims {
+		out[k] = v
+	}
+	if _, ok := out["iat"]; !ok {
+		out["iat"] = now.Unix()
+	}
+	if _, ok := out["jti"]; !ok {
+		out["jti"] = random.NewID()
+	}
+
+	header := map[string]any{
+		"alg": "RS256",
+		"typ": "JWT",
+	}
+	keyID, key, err := s.activeKey()
+	if err != nil {
+		return "", err
+	}
+	if keyID != "" {
+		header["kid"] = keyID
+	}
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return "", fmt.Errorf("marshal header: %w", err)
+	}
+	claimsJSON, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("marshal claims: %w", err)
+	}
+	tokenUnsigned := base64.RawURLEncoding.EncodeToString(headerJSON) + "." + base64.RawURLEncoding.EncodeToString(claimsJSON)
+	hash := sha256.Sum256([]byte(tokenUnsigned))
+	sig, err := rsa.SignPKCS1v15(rand.Reader, key, crypto.SHA256, hash[:])
+	if err != nil {
+		return "", fmt.Errorf("sign token: %w", err)
+	}
+	return tokenUnsigned + "." + base64.RawURLEncoding.EncodeToString(sig), nil
+}
+
+// PublicKeyPEM returns the active RSA public key, PEM-encoded (SubjectPublicKeyInfo),
+// for out-of-band distribution to relying parties that expect an uploaded key file
+// rather than JWKS (e.g. a staging tenant's Trusted Auth Token "Public Keys" section).
+func (s *Signer) PublicKeyPEM() (string, error) {
+	s.mu.RLock()
+	pub := s.publicKey
+	s.mu.RUnlock()
+	if pub == nil {
+		return "", errors.New("missing signing key")
+	}
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return "", fmt.Errorf("marshal public key: %w", err)
+	}
+	block := &pem.Block{Type: "PUBLIC KEY", Bytes: der}
+	return string(pem.EncodeToMemory(block)), nil
+}
+
 // Verify validates a JWT and returns map claims.
 func (s *Signer) Verify(token, expectedAudience string) (MapClaims, error) {
 	aud := expectedAudience

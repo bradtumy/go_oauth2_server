@@ -49,6 +49,14 @@ type Config struct {
 	UpstreamScopes       []string
 	UpstreamDisplayName  string
 	PublicBaseURL        string
+
+	// Trusted Auth Token (TAT) IdP mode. Tokenator stands in for an external
+	// customer IdP, minting tokens for a third-party tenant to consume, so the
+	// issuer and audience here are deliberately not tokenator's own.
+	// TATTenantHost empty disables the feature.
+	TATIssuer     string
+	TATTenantHost string
+	TATTokenTTL   time.Duration
 }
 
 // UpstreamRedirectURL is the callback the upstream provider must be configured
@@ -80,6 +88,7 @@ const (
 	defaultIntrospectBurst = 20
 	defaultAdminRPS        = 5
 	defaultAdminBurst      = 10
+	defaultTATTokenTTL     = 300
 )
 
 const defaultSigningKeyPEM = `-----BEGIN PRIVATE KEY-----
@@ -190,6 +199,14 @@ func Load() (*Config, error) {
 	cfg.UpstreamDisplayName = firstNonEmpty(getEnv("UPSTREAM_DISPLAY_NAME", ""), "SSO")
 	cfg.PublicBaseURL = strings.TrimSpace(getEnv("PUBLIC_BASE_URL", ""))
 	cfg.UpstreamScopes = splitAndTrim(getEnv("UPSTREAM_SCOPES", "openid,email,profile"))
+
+	cfg.TATTenantHost = strings.TrimSpace(getEnv("TAT_TENANT_HOST", ""))
+	cfg.TATIssuer = firstNonEmpty(getEnv("TAT_ISSUER", ""), cfg.Issuer)
+	tatTokenTTL, err := parseDurationSeconds("TAT_TOKEN_TTL_SECONDS", defaultTATTokenTTL)
+	if err != nil {
+		return nil, err
+	}
+	cfg.TATTokenTTL = tatTokenTTL
 
 	authorizeRPS, err := parseIntAllowZero("AS_RATE_LIMIT_AUTHORIZE_RPS", defaultAuthorizeRPS)
 	if err != nil {

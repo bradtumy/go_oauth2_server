@@ -32,6 +32,7 @@ import (
 	"tokenator/internal/store"
 	memstore "tokenator/internal/store/mem"
 	sqlstore "tokenator/internal/store/sqlite"
+	"tokenator/internal/tatidp"
 )
 
 func main() {
@@ -75,6 +76,18 @@ func main() {
 	signer, err := buildSigner(cfg)
 	if err != nil {
 		log.Fatalf("init signer: %v", err)
+	}
+
+	// TAT IdP mode: tokenator stands in for a customer's own identity provider,
+	// minting Trusted Auth Tokens for a third-party tenant to consume.
+	tatHandler, err := tatidp.NewHandler(signer, cfg.TATIssuer, cfg.TATTenantHost, cfg.TATTokenTTL)
+	if err != nil {
+		log.Fatalf("init tat idp handler: %v", err)
+	}
+	if cfg.TATTenantHost != "" {
+		log.Printf("TAT IdP enabled: issuer=%s tenant_host=%s callback=%s", cfg.TATIssuer, cfg.TATTenantHost, tatHandler.CallbackURL)
+	} else {
+		log.Printf("TAT IdP disabled (set TAT_TENANT_HOST to enable)")
 	}
 	if cfg.SigningKeyDir != "" && cfg.SigningKeyRotationInterval > 0 {
 		startKeyRotation(cfg, signer)
@@ -129,6 +142,20 @@ func main() {
 	// configured, so the routes are inert rather than half-working.
 	mux.Handle("/auth/sso/login", methodHandler(http.MethodGet, authHandler.HandleSSOStart))
 	mux.Handle("/auth/sso/callback", methodHandler(http.MethodGet, authHandler.HandleSSOCallback))
+
+	// TAT IdP routes. These serve a login form and mint a Trusted Auth Token
+	// for the configured tenant; they return 412 until TAT_TENANT_HOST is set.
+	mux.HandleFunc("/tat/login", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			tatHandler.ShowLogin(w, r)
+		case http.MethodPost:
+			tatHandler.HandleLogin(w, r)
+		default:
+			methodNotAllowed(w, r, http.MethodGet, http.MethodPost)
+		}
+	})
+	mux.Handle("/tat/public-key.pem", methodHandler(http.MethodGet, tatHandler.PublicKeyPEM))
 	mux.Handle("/consent", authHandler.RequireAuth(methodHandler(http.MethodPost, srv.handleConsent)))
 
 	// OAuth routes with authentication required
