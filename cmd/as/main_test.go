@@ -907,7 +907,7 @@ func authorizeWithConsent(t *testing.T, srv *authorizationServer, server *httpte
 
 	form := url.Values{}
 	form.Set("action", "approve")
-	for _, field := range []string{"client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method"} {
+	for _, field := range []string{"client_id", "redirect_uri", "scope", "state", "code_challenge", "code_challenge_method", "nonce"} {
 		if v := params.Get(field); v != "" {
 			form.Set(field, v)
 		}
@@ -962,7 +962,7 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 			store.GrantClientCredentials,
 			store.GrantTokenExchange,
 		},
-		Scopes:    []string{"openid", "orders:read", "orders:export"},
+		Scopes:    []string{"openid", "profile", "email", "orders:read", "orders:export"},
 		Audiences: []string{cfg.Audience},
 	})
 	if err != nil {
@@ -1009,6 +1009,7 @@ func newTestServerWithConfig(t *testing.T, identityStore identity.Store, cfg *co
 	mux.Handle("/oauth2/authorize", authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize)))
 	mux.Handle("/consent", authHandler.RequireAuth(methodHandler(http.MethodPost, srv.handleConsent)))
 	mux.HandleFunc("/oauth2/token", methodHandler(http.MethodPost, srv.handleToken))
+	mux.Handle("/userinfo", methodHandler(http.MethodGet, srv.handleUserInfo))
 	mux.HandleFunc("/oauth2/introspect", methodHandler(http.MethodPost, srv.handleIntrospect))
 	mux.HandleFunc("/oauth2/revoke", methodHandler(http.MethodPost, srv.handleRevoke))
 	mux.HandleFunc("/subject-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
@@ -1124,4 +1125,244 @@ func TestSeedIdentitiesHashesPasswords(t *testing.T) {
 	if noPass.PasswordHash != "" {
 		t.Fatal("expected no password hash when the seed omits one")
 	}
+}
+
+// TestIDTokenIssuedForOpenIDScope covers the promise the discovery document has
+// always made: a client asking for openid gets an ID token alongside the access
+// token, audienced to itself, echoing its nonce.
+func TestIDTokenIssuedForOpenIDScope(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{
+		Email:      "oidc@example.com",
+		Name:       "OIDC User",
+		TenantID:   "demo",
+		Attributes: map[string]string{"role": "manager"},
+	})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	params := authorizeParams(testClientID, "http://localhost/callback", "openid profile email")
+	params.Set("nonce", "client-nonce-123")
+	code := authorizeCode(t, srv, server, human, params)
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+	}
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	rawID, _ := tokenResp["id_token"].(string)
+	if rawID == "" {
+		t.Fatal("expected an id_token when openid was requested")
+	}
+	access, _ := tokenResp["access_token"].(string)
+
+	// An ID token is audienced to the client, not to a resource server: that is
+	// what stops it being replayed as a bearer credential against an API.
+	claims, err := srv.signer.Verify(rawID, testClientID)
+	if err != nil {
+		t.Fatalf("id token did not verify with the client as audience: %v", err)
+	}
+
+	if claims["sub"] != human.ID {
+		t.Errorf("sub = %v, want %s", claims["sub"], human.ID)
+	}
+	if claims["nonce"] != "client-nonce-123" {
+		t.Errorf("nonce = %v, want the value the client sent", claims["nonce"])
+	}
+	if claims["name"] != "OIDC User" {
+		t.Errorf("name = %v (profile scope was granted)", claims["name"])
+	}
+	if claims["email"] != "oidc@example.com" {
+		t.Errorf("email = %v (email scope was granted)", claims["email"])
+	}
+	if claims["email_verified"] != true {
+		t.Errorf("email_verified = %v", claims["email_verified"])
+	}
+	if claims["role"] != "manager" {
+		t.Errorf("profile attribute role = %v, want manager", claims["role"])
+	}
+	if _, ok := claims["auth_time"]; !ok {
+		t.Error("expected auth_time")
+	}
+	if got := claims["at_hash"]; got != internaljwt.AtHash(access) {
+		t.Errorf("at_hash = %v, does not bind the access token", got)
+	}
+}
+
+// TestIDTokenOmittedWithoutOpenIDScope keeps authentication opt-in: a client
+// that asked only for authorization must not receive an identity assertion.
+func TestIDTokenOmittedWithoutOpenIDScope(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{Email: "noid@example.com", Name: "No ID"})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "orders:read"))
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, present := tokenResp["id_token"]; present {
+		t.Fatal("id_token must not be issued without the openid scope")
+	}
+}
+
+// TestIDTokenClaimsAreScopeGated covers OpenID Connect claim release: openid
+// alone identifies the subject and nothing more.
+func TestIDTokenClaimsAreScopeGated(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{
+		Email:      "gated@example.com",
+		Name:       "Gated User",
+		Attributes: map[string]string{"role": "auditor"},
+	})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	code := authorizeCode(t, srv, server, human, authorizeParams(testClientID, "http://localhost/callback", "openid"))
+
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("code", code)
+	form.Set("redirect_uri", "http://localhost/callback")
+	form.Set("client_id", testClientID)
+	form.Set("client_secret", testClientSecret)
+	resp, err := http.PostForm(server.URL+"/oauth2/token", form)
+	if err != nil {
+		t.Fatalf("token request: %v", err)
+	}
+	defer resp.Body.Close()
+	var tokenResp map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	claims, err := srv.signer.Verify(tokenResp["id_token"].(string), testClientID)
+	if err != nil {
+		t.Fatalf("verify id token: %v", err)
+	}
+
+	if claims["sub"] != human.ID {
+		t.Errorf("sub should always be present, got %v", claims["sub"])
+	}
+	for _, withheld := range []string{"name", "email", "email_verified", "role"} {
+		if _, present := claims[withheld]; present {
+			t.Errorf("%q must not be released without its scope", withheld)
+		}
+	}
+}
+
+// TestUserInfoReturnsScopedClaims covers the UserInfo endpoint, including that
+// it refuses a token that was never issued for authentication.
+func TestUserInfoReturnsScopedClaims(t *testing.T) {
+	ctx := context.Background()
+	idStore := memstore.New()
+	human, err := idStore.CreateHuman(ctx, identity.Human{
+		Email:      "ui@example.com",
+		Name:       "UserInfo Person",
+		Attributes: map[string]string{"department": "engineering"},
+	})
+	if err != nil {
+		t.Fatalf("create human: %v", err)
+	}
+
+	srv, server := newTestServer(t, idStore)
+	defer server.Close()
+
+	t.Run("anonymous is challenged", func(t *testing.T) {
+		resp, err := http.Get(server.URL + "/userinfo")
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("expected 401, got %d", resp.StatusCode)
+		}
+		if resp.Header.Get("WWW-Authenticate") == "" {
+			t.Error("expected a WWW-Authenticate challenge")
+		}
+	})
+
+	t.Run("openid token returns claims", func(t *testing.T) {
+		token := mintScopedAccessToken(t, srv, server, human, "openid profile email")
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
+		}
+		var claims map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&claims); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if claims["sub"] != human.ID {
+			t.Errorf("sub = %v, want %s", claims["sub"], human.ID)
+		}
+		if claims["email"] != "ui@example.com" {
+			t.Errorf("email = %v", claims["email"])
+		}
+		if claims["department"] != "engineering" {
+			t.Errorf("department = %v", claims["department"])
+		}
+	})
+
+	t.Run("token without openid is refused", func(t *testing.T) {
+		token := mintScopedAccessToken(t, srv, server, human, "orders:read")
+		req, _ := http.NewRequest(http.MethodGet, server.URL+"/userinfo", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("expected 403 without the openid scope, got %d", resp.StatusCode)
+		}
+	})
 }

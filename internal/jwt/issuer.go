@@ -114,6 +114,80 @@ func (s *Signer) IssueOBOToken(ctx context.Context, subject, clientID string, pe
 	return s.issue(ctx, subject, clientID, scope, perms, authz, ttl, audience, extraMap, "")
 }
 
+// IDTokenRequest describes an OpenID Connect ID token to issue.
+type IDTokenRequest struct {
+	// Subject is the end user's stable identifier, becoming the sub claim.
+	Subject string
+	// ClientID becomes the audience: an ID token is issued *to* the client,
+	// unlike an access token, which is issued for a resource server.
+	ClientID string
+	// Nonce, when the client sent one, is echoed so the client can tie the
+	// token to its own authorization request.
+	Nonce string
+	// AccessToken, when present, produces an at_hash claim binding the two
+	// tokens together (OpenID Connect Core 3.1.3.6).
+	AccessToken string
+	// Claims are the identity claims released for the granted scopes.
+	Claims map[string]any
+	TTL    time.Duration
+}
+
+// IssueIDToken issues an OpenID Connect ID token.
+//
+// An ID token asserts who authenticated to the client, so its audience is the
+// client rather than a resource server, and it must not be used as a bearer
+// credential against an API.
+func (s *Signer) IssueIDToken(req IDTokenRequest) (string, error) {
+	if strings.TrimSpace(req.Subject) == "" {
+		return "", errors.New("id token requires a subject")
+	}
+	if strings.TrimSpace(req.ClientID) == "" {
+		return "", errors.New("id token requires a client id")
+	}
+	ttl := req.TTL
+	if ttl <= 0 {
+		ttl = s.accessTTL
+	}
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+
+	now := time.Now().UTC()
+	claims := MapClaims{
+		"iss":       s.issuer,
+		"sub":       req.Subject,
+		"aud":       req.ClientID,
+		"iat":       now.Unix(),
+		"nbf":       now.Unix(),
+		"exp":       now.Add(ttl).Unix(),
+		"jti":       random.NewID(),
+		"auth_time": now.Unix(),
+	}
+	for k, v := range req.Claims {
+		// Never let released claims overwrite the token's own identity.
+		switch k {
+		case "iss", "sub", "aud", "iat", "nbf", "exp", "jti", "nonce", "at_hash":
+			continue
+		}
+		claims[k] = v
+	}
+	if req.Nonce != "" {
+		claims["nonce"] = req.Nonce
+	}
+	if req.AccessToken != "" {
+		claims["at_hash"] = AtHash(req.AccessToken)
+	}
+
+	return s.IssueRaw(claims)
+}
+
+// AtHash computes the OpenID Connect at_hash: the left-most half of the
+// SHA-256 of the access token's ASCII representation, base64url encoded.
+func AtHash(accessToken string) string {
+	sum := sha256.Sum256([]byte(accessToken))
+	return base64.RawURLEncoding.EncodeToString(sum[:len(sum)/2])
+}
+
 // IssueSubjectAssertion issues a subject assertion JWT for token exchange bootstrap.
 func (s *Signer) IssueSubjectAssertion(ctx context.Context, subject string, ttl time.Duration) (string, int, error) {
 	if ttl <= 0 {

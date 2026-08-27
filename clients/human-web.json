@@ -9,6 +9,9 @@
     "refresh_token"
   ],
   "scopes": [
+    "openid",
+    "profile",
+    "email",
     "tickets.read"
   ]
 }

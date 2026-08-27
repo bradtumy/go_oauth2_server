@@ -186,6 +186,7 @@ func main() {
 	mux.Handle("/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
 	mux.Handle("/oauth2/authorize", rateLimitMiddleware(authorizeLimiter, authHandler.RequireAuth(methodHandler(http.MethodGet, srv.handleAuthorize))))
 	mux.Handle("/oauth2/token", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleToken)))
+	mux.Handle("/userinfo", methodHandler(http.MethodGet, srv.handleUserInfo))
 	mux.Handle("/oauth2/introspect", rateLimitMiddleware(introspectLimiter, methodHandler(http.MethodPost, srv.handleIntrospect)))
 	mux.Handle("/oauth2/revoke", rateLimitMiddleware(tokenLimiter, methodHandler(http.MethodPost, srv.handleRevoke)))
 	mux.HandleFunc("/mint-assertion", methodHandler(http.MethodPost, srv.handleSubjectAssertion))
@@ -305,6 +306,57 @@ func (s *authorizationServer) legacyHuman(id string) (identity.Human, bool) {
 		Name:     name,
 		TenantID: "legacy",
 	}, true
+}
+
+// hasScope reports whether a space-delimited scope string grants scope.
+func hasScope(granted, scope string) bool {
+	for _, s := range strings.Fields(granted) {
+		if s == scope {
+			return true
+		}
+	}
+	return false
+}
+
+// idTokenClaims selects the identity claims to release for the granted scopes.
+//
+// OpenID Connect ties claim release to scopes rather than handing every client
+// the whole profile: "profile" covers the display name and the profile
+// attributes, "email" covers the address. Custom attributes travel under
+// "profile" because that is what they are, and are flattened to top-level
+// claims so ordinary OIDC clients can read them without knowing about
+// tokenator.
+func (s *authorizationServer) idTokenClaims(h identity.Human, grantedScope string) map[string]any {
+	claims := map[string]any{}
+
+	if hasScope(grantedScope, "profile") {
+		if h.Name != "" {
+			claims["name"] = h.Name
+		}
+		if h.TenantID != "" {
+			claims["tenant_id"] = h.TenantID
+		}
+		for k, v := range h.Attributes {
+			// Do not let an attribute shadow a claim released by another scope.
+			if k == "email" || k == "email_verified" {
+				continue
+			}
+			claims[k] = v
+		}
+	}
+
+	if hasScope(grantedScope, "email") && h.Email != "" {
+		claims["email"] = h.Email
+		// The address was verified by whoever provisioned the profile, whether
+		// that was the seed file, an operator, or a federated sign-in that
+		// required a verified address upstream.
+		claims["email_verified"] = true
+	}
+
+	if len(claims) == 0 {
+		return nil
+	}
+	return claims
 }
 
 func (s *authorizationServer) humanExtraClaims(h identity.Human) map[string]any {
@@ -461,7 +513,9 @@ func (s *authorizationServer) handleOpenIDConfiguration(w http.ResponseWriter, r
 		"grant_types_supported":                            []string{"authorization_code", "refresh_token", "client_credentials", "urn:ietf:params:oauth:grant-type:token-exchange"},
 		"subject_types_supported":                          []string{"public"},
 		"id_token_signing_alg_values_supported":            []string{"RS256"},
-		"scopes_supported":                                 []string{"openid", "orders:read", "orders:export"},
+		"userinfo_endpoint":                                issuer + "/userinfo",
+		"scopes_supported":                                 []string{"openid", "profile", "email", "orders:read", "orders:export"},
+		"claims_supported":                                 []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "name", "email", "email_verified", "tenant_id"},
 		"token_endpoint_auth_methods_supported":            []string{"client_secret_basic", "client_secret_post", "private_key_jwt", "none"},
 		"token_endpoint_auth_signing_alg_values_supported": clientAssertionAlgValues,
 		"dpop_signing_alg_values_supported":                dpopAlgValues,
@@ -551,7 +605,15 @@ func (s *authorizationServer) handleAuthorize(w http.ResponseWriter, r *http.Req
 	state := q.Get("state")
 
 	// Show consent page (user must approve before we issue a code)
-	s.authHandler.ShowConsent(w, r, sess, client, scope, redirectURI, state, codeChallenge, codeChallengeMethod)
+	s.authHandler.ShowConsent(w, r, sess, auth.ConsentRequest{
+		Client:              client,
+		Scope:               scope,
+		RedirectURI:         redirectURI,
+		State:               state,
+		CodeChallenge:       codeChallenge,
+		CodeChallengeMethod: codeChallengeMethod,
+		Nonce:               q.Get("nonce"),
+	})
 }
 
 func (s *authorizationServer) handleConsent(w http.ResponseWriter, r *http.Request) {
@@ -575,6 +637,7 @@ func (s *authorizationServer) handleConsent(w http.ResponseWriter, r *http.Reque
 	state := r.PostFormValue("state")
 	codeChallenge := r.PostFormValue("code_challenge")
 	codeChallengeMethod := r.PostFormValue("code_challenge_method")
+	nonce := r.PostFormValue("nonce")
 
 	// User denied consent
 	if action != "approve" {
@@ -592,6 +655,7 @@ func (s *authorizationServer) handleConsent(w http.ResponseWriter, r *http.Reque
 		Scope:               scope,
 		CodeChallenge:       codeChallenge,
 		CodeChallengeMethod: codeChallengeMethod,
+		Nonce:               nonce,
 		IssuedAt:            time.Now().UTC(),
 		ExpiresAt:           time.Now().Add(s.cfg.CodeTTL),
 	})
@@ -890,13 +954,86 @@ func (s *authorizationServer) handleAuthorizationCodeGrant(w http.ResponseWriter
 
 	log.Printf("[TOKEN] ✓ Tokens issued: subject=%s, expires_in=%d, refresh_token=true", human.ID, expiresIn)
 
-	writeTokenResponse(w, map[string]any{
+	response := map[string]any{
 		"access_token":  access,
 		"token_type":    "bearer",
 		"expires_in":    expiresIn,
 		"refresh_token": refresh,
 		"scope":         record.Scope,
+	}
+	s.attachIDToken(response, human, client.ID, record.Scope, record.Nonce, access)
+	writeTokenResponse(w, response)
+}
+
+// handleUserInfo serves the OpenID Connect UserInfo endpoint.
+//
+// It authenticates with the access token rather than a session, releases the
+// same scope-gated claims as the ID token, and always includes sub so a client
+// can confirm the response describes the subject it expected.
+func (s *authorizationServer) handleUserInfo(w http.ResponseWriter, r *http.Request) {
+	header := r.Header.Get("Authorization")
+	if !strings.HasPrefix(strings.ToLower(header), "bearer ") {
+		// RFC 6750 requires the scheme be advertised on a challenge.
+		w.Header().Set("WWW-Authenticate", `Bearer realm="tokenator"`)
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "bearer token required")
+		return
+	}
+	token := strings.TrimSpace(header[len("bearer "):])
+
+	claims, err := s.signer.Verify(token, s.cfg.Audience)
+	if err != nil {
+		w.Header().Set("WWW-Authenticate", `Bearer error="invalid_token"`)
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "token verification failed")
+		return
+	}
+
+	scope, _ := claims["scope"].(string)
+	if !hasScope(scope, "openid") {
+		// Without openid this token was never issued for authentication, so it
+		// does not carry the consent needed to release identity claims.
+		w.Header().Set("WWW-Authenticate", `Bearer error="insufficient_scope", scope="openid"`)
+		writeOAuthError(w, http.StatusForbidden, "insufficient_scope", "openid scope required")
+		return
+	}
+
+	subject, _ := claims["sub"].(string)
+	human, err := s.lookupHumanByID(r.Context(), subject)
+	if err != nil {
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_token", "subject not found")
+		return
+	}
+
+	response := map[string]any{"sub": human.ID}
+	for k, v := range s.idTokenClaims(human, scope) {
+		response[k] = v
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+// attachIDToken adds an ID token to a token response when the granted scope
+// includes openid. An access token says what the bearer may do; an ID token
+// says who signed in, which is why it is only issued when the client asked for
+// authentication rather than only authorization.
+func (s *authorizationServer) attachIDToken(response map[string]any, human identity.Human, clientID, grantedScope, nonce, accessToken string) {
+	if !hasScope(grantedScope, "openid") {
+		return
+	}
+	idToken, err := s.signer.IssueIDToken(internaljwt.IDTokenRequest{
+		Subject:     human.ID,
+		ClientID:    clientID,
+		Nonce:       nonce,
+		AccessToken: accessToken,
+		Claims:      s.idTokenClaims(human, grantedScope),
+		TTL:         s.cfg.AccessTokenTTL,
 	})
+	if err != nil {
+		// The access token is already issued and valid; failing the whole
+		// exchange over the ID token would be worse than omitting it.
+		log.Printf("[TOKEN] ✗ ID token issuance failed, continuing without it: %v", err)
+		return
+	}
+	response["id_token"] = idToken
+	log.Printf("[TOKEN] ✓ ID token issued: subject=%s audience=%s", human.ID, clientID)
 }
 
 func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *http.Request, client store.Client) {
@@ -988,13 +1125,18 @@ func (s *authorizationServer) handleRefreshTokenGrant(w http.ResponseWriter, r *
 
 	log.Printf("[TOKEN] ✓ Refresh token rotated successfully: subject=%s, family_id=%s", human.ID, rt.FamilyID)
 
-	writeTokenResponse(w, map[string]any{
+	response := map[string]any{
 		"access_token":  access,
 		"token_type":    "bearer",
 		"expires_in":    expiresIn,
 		"refresh_token": newRefresh,
 		"scope":         rt.Scope,
-	})
+	}
+	// No nonce on refresh: it belongs to the original authorization request, and
+	// echoing a stale one would let a client mistake this for a fresh
+	// authentication.
+	s.attachIDToken(response, human, client.ID, rt.Scope, "", access)
+	writeTokenResponse(w, response)
 }
 
 func (s *authorizationServer) handleClientCredentialsGrant(w http.ResponseWriter, r *http.Request, client store.Client) {

@@ -15,8 +15,11 @@ type AuthorizationCode struct {
 	Scope               string
 	CodeChallenge       string
 	CodeChallengeMethod string
-	IssuedAt            time.Time
-	ExpiresAt           time.Time
+	// Nonce is the OIDC nonce from the authorization request. It is bound into
+	// the ID token so a client can tie the token back to its own request.
+	Nonce     string
+	IssuedAt  time.Time
+	ExpiresAt time.Time
 }
 
 // RefreshToken represents a refresh token record.

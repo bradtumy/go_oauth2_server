@@ -29,6 +29,7 @@ type ConsentData struct {
 	State               string
 	CodeChallenge       string
 	CodeChallengeMethod string
+	Nonce               string
 }
 
 // ScopeDescriptions maps OAuth scopes to user-friendly descriptions
@@ -45,10 +46,24 @@ var ScopeDescriptions = map[string]string{
 	"payments.write": "Process payments",
 }
 
+// ConsentRequest carries the authorization request details that must survive the
+// consent page and come back with the approval. Grouped into a struct because
+// the parameter list had grown past the point where its order was readable.
+type ConsentRequest struct {
+	Client              store.Client
+	Scope               string
+	RedirectURI         string
+	State               string
+	CodeChallenge       string
+	CodeChallengeMethod string
+	// Nonce is the OIDC nonce, which must reach the issued ID token.
+	Nonce string
+}
+
 // ShowConsent displays the OAuth consent page
-func (h *Handler) ShowConsent(w http.ResponseWriter, r *http.Request, sess *session.Session, client store.Client, scope, redirectURI, state, codeChallenge, codeChallengeMethod string) {
+func (h *Handler) ShowConsent(w http.ResponseWriter, r *http.Request, sess *session.Session, req ConsentRequest) {
 	// Parse scopes into permissions
-	scopes := strings.Fields(scope)
+	scopes := strings.Fields(req.Scope)
 	permissions := make([]Permission, 0, len(scopes))
 
 	for _, s := range scopes {
@@ -63,16 +78,17 @@ func (h *Handler) ShowConsent(w http.ResponseWriter, r *http.Request, sess *sess
 	}
 
 	data := ConsentData{
-		ClientName:          client.ID,
-		ClientID:            client.ID,
+		ClientName:          req.Client.ID,
+		ClientID:            req.Client.ID,
 		UserEmail:           sess.Email,
 		Permissions:         permissions,
 		CSRFToken:           sess.CSRFToken,
-		RedirectURI:         redirectURI,
-		Scope:               scope,
-		State:               state,
-		CodeChallenge:       codeChallenge,
-		CodeChallengeMethod: codeChallengeMethod,
+		RedirectURI:         req.RedirectURI,
+		Scope:               req.Scope,
+		State:               req.State,
+		CodeChallenge:       req.CodeChallenge,
+		CodeChallengeMethod: req.CodeChallengeMethod,
+		Nonce:               req.Nonce,
 	}
 
 	if err := h.templates.ExecuteTemplate(w, "consent.html", data); err != nil {
