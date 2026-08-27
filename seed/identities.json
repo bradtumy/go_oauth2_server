@@ -1,25 +1,47 @@
 {
+  "_comment": [
+    "Human ids are pinned deliberately. Identities live in an in-memory store and",
+    "are reseeded on every boot, so an unpinned id would be regenerated each time.",
+    "The id becomes the TAT 'sub', and a relying party keys the end user on that",
+    "value: letting it drift would make every restart look like a brand-new user.",
+    "Attributes are surfaced as custom claims in the TAT claim bags."
+  ],
   "humans": [
     {
+      "id": "11111111-1111-4111-8111-111111111111",
       "email": "alice@example.com",
       "name": "Alice Anderson",
       "tenant_id": "demo",
       "password": "tokenator-demo",
-      "attributes": { "role": "manager" }
+      "attributes": {
+        "role": "manager",
+        "department": "engineering",
+        "employee_id": "E-1001"
+      }
     },
     {
+      "id": "22222222-2222-4222-8222-222222222222",
       "email": "bob@example.com",
       "name": "Bob Brown",
       "tenant_id": "demo",
       "password": "tokenator-demo",
-      "attributes": { "role": "analyst" }
+      "attributes": {
+        "role": "analyst",
+        "department": "finance",
+        "employee_id": "E-1002"
+      }
     },
     {
+      "id": "33333333-3333-4333-8333-333333333333",
       "email": "carol@example.com",
       "name": "Carol Chen",
       "tenant_id": "demo",
       "password": "tokenator-demo",
-      "attributes": { "role": "auditor" }
+      "attributes": {
+        "role": "auditor",
+        "department": "compliance",
+        "employee_id": "E-1003"
+      }
     }
   ],
   "agents": [

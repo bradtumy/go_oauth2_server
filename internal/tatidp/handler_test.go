@@ -1,8 +1,11 @@
 package tatidp
 
 import (
+	"context"
 	"crypto/rsa"
 	"crypto/x509"
+	"encoding/base64"
+	"encoding/json"
 	"encoding/pem"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +17,9 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"tokenator/internal/identity"
 	internaljwt "tokenator/internal/jwt"
+	memstore "tokenator/internal/store/mem"
 )
 
 const testSigningKeyPEM = `-----BEGIN PRIVATE KEY-----
@@ -48,6 +53,7 @@ odOEQaR0ILGMQJZmpfvekDyK
 
 const (
 	testIssuer     = "https://login.acme.example"
+	testAudience   = "https://auth.acme.example"
 	testTenantHost = "tenant.example.com"
 )
 
@@ -62,21 +68,45 @@ func newTestHandler(t *testing.T, tenantHost string) *Handler {
 	if err != nil {
 		t.Fatalf("init signer: %v", err)
 	}
-	h, err := NewHandlerWithTemplates(signer, testIssuer, tenantHost, 5*time.Minute,
-		filepath.Join("..", "..", "web", "templates"))
+	idStore := memstore.New()
+	if _, err := idStore.CreateHuman(context.Background(), identity.Human{
+		ID:       "11111111-1111-4111-8111-111111111111",
+		Email:    "alice@example.com",
+		Name:     "Alice Anderson",
+		TenantID: "demo",
+		Attributes: map[string]string{
+			"role":       "manager",
+			"department": "engineering",
+		},
+	}); err != nil {
+		t.Fatalf("seed human: %v", err)
+	}
+
+	h, err := NewHandler(Options{
+		Signer:                    signer,
+		Issuer:                    testIssuer,
+		Audience:                  testAudience,
+		TenantHost:                tenantHost,
+		TokenTTL:                  5 * time.Minute,
+		Scopes:                    "openid profile orders.read",
+		AuthorizationDetailsTypes: []string{"agent-action"},
+		Identities:                idStore,
+		TemplateDir:               filepath.Join("..", "..", "web", "templates"),
+	})
 	if err != nil {
 		t.Fatalf("init handler: %v", err)
 	}
 	return h
 }
 
-// TestMintedTATVerifiesAgainstPublishedKey is the contract the tenant depends
-// on: the tenant is configured with the issuer string and the public key served
+// TestMintedTATVerifiesAgainstPublishedKey is the contract the relying party
+// depends on: it is configured with the issuer string and the public key served
 // at /tat/public-key.pem, and rejects the token if either fails to line up.
 //
-// The audience must be the tenant, and the issuer the configured TAT issuer —
-// neither is tokenator's own identity, which is why this path signs raw claims
-// instead of going through the normal access-token issuer.
+// Neither the issuer nor the audience is tokenator's own identity — the issuer
+// is this IdP as the relying party knows it, and the audience is the relying
+// party's authorization server. That is why this path signs raw claims rather
+// than going through the normal access-token issuer.
 func TestMintedTATVerifiesAgainstPublishedKey(t *testing.T) {
 	h := newTestHandler(t, testTenantHost)
 
@@ -104,7 +134,7 @@ func TestMintedTATVerifiesAgainstPublishedKey(t *testing.T) {
 	parsed, err := jwt.Parse(token, func(*jwt.Token) (any, error) { return pub, nil },
 		jwt.WithValidMethods([]string{"RS256"}),
 		jwt.WithIssuer(testIssuer),
-		jwt.WithAudience("https://"+testTenantHost),
+		jwt.WithAudience(testAudience),
 	)
 	if err != nil {
 		t.Fatalf("tenant-side verification failed: %v", err)
@@ -114,20 +144,107 @@ func TestMintedTATVerifiesAgainstPublishedKey(t *testing.T) {
 		t.Fatal("token did not yield valid claims")
 	}
 
-	if claims["sub"] != "alice@example.com" {
-		t.Errorf("sub = %v, want alice@example.com", claims["sub"])
-	}
-	if claims["email"] != "alice@example.com" {
-		t.Errorf("email = %v", claims["email"])
-	}
-	if claims["name"] != "Alice Anderson" {
-		t.Errorf("name = %v", claims["name"])
+	// sub is the profile's stable id, not the email: the relying party keys the
+	// end user on it, and an email can change.
+	if claims["sub"] != "11111111-1111-4111-8111-111111111111" {
+		t.Errorf("sub = %v, want the profile's stable id", claims["sub"])
 	}
 	if claims["nonce"] != "tenant-nonce-1" {
-		t.Errorf("nonce = %v, want the value the tenant sent", claims["nonce"])
+		t.Errorf("nonce = %v, want the value the relying party sent", claims["nonce"])
+	}
+	if claims[claimDisplayName] != "Alice Anderson" {
+		t.Errorf("%s = %v", claimDisplayName, claims[claimDisplayName])
+	}
+	if claims[claimScopes] != "openid profile orders.read" {
+		t.Errorf("%s = %v", claimScopes, claims[claimScopes])
 	}
 	if _, ok := claims["exp"]; !ok {
 		t.Error("token must carry exp")
+	}
+
+	types, ok := claims[claimAuthorizationDetailTypes].([]any)
+	if !ok || len(types) != 1 || types[0] != "agent-action" {
+		t.Errorf("%s = %v", claimAuthorizationDetailTypes, claims[claimAuthorizationDetailTypes])
+	}
+}
+
+// TestProfileAttributesBecomeCustomClaims covers the mechanism the relying party
+// uses to place profile data into the tokens it later issues: the attributes on
+// the local profile are surfaced in the three claim bags.
+func TestProfileAttributesBecomeCustomClaims(t *testing.T) {
+	h := newTestHandler(t, testTenantHost)
+
+	form := url.Values{}
+	form.Set("name", "ignored, the profile wins")
+	form.Set("email", "alice@example.com")
+	form.Set("nonce", "n")
+
+	req := httptest.NewRequest(http.MethodPost, "/tat/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.HandleLogin(rec, req)
+
+	claims := decodeClaims(t, extractHiddenInput(t, rec.Body.String(), "token"))
+
+	// The profile's display name takes precedence over whatever was typed.
+	if claims[claimDisplayName] != "Alice Anderson" {
+		t.Errorf("expected the profile name to win, got %v", claims[claimDisplayName])
+	}
+
+	for _, bag := range []string{claimAccessTokenClaims, claimIDTokenClaims, claimUserinfoClaims} {
+		custom, ok := claims[bag].(map[string]any)
+		if !ok {
+			t.Errorf("%s is not an object: %v", bag, claims[bag])
+			continue
+		}
+		if custom["role"] != "manager" {
+			t.Errorf("%s: role = %v, want manager", bag, custom["role"])
+		}
+		if custom["department"] != "engineering" {
+			t.Errorf("%s: department = %v, want engineering", bag, custom["department"])
+		}
+		if custom["email"] != "alice@example.com" {
+			t.Errorf("%s: email = %v", bag, custom["email"])
+		}
+		if custom["tenant_id"] != "demo" {
+			t.Errorf("%s: tenant_id = %v", bag, custom["tenant_id"])
+		}
+	}
+}
+
+// TestUnknownEmailStillMints keeps the handler usable for ad-hoc testing: an
+// email with no local profile falls back to the submitted display name and
+// carries no profile attributes.
+func TestUnknownEmailStillMints(t *testing.T) {
+	h := newTestHandler(t, testTenantHost)
+
+	form := url.Values{}
+	form.Set("name", "Ad Hoc Tester")
+	form.Set("email", "nobody@example.com")
+	form.Set("nonce", "n")
+
+	req := httptest.NewRequest(http.MethodPost, "/tat/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	h.HandleLogin(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+	claims := decodeClaims(t, extractHiddenInput(t, rec.Body.String(), "token"))
+
+	if claims["sub"] != "nobody@example.com" {
+		t.Errorf("sub = %v, want the submitted email as a fallback", claims["sub"])
+	}
+	if claims[claimDisplayName] != "Ad Hoc Tester" {
+		t.Errorf("%s = %v", claimDisplayName, claims[claimDisplayName])
+	}
+	custom, ok := claims[claimIDTokenClaims].(map[string]any)
+	if !ok {
+		t.Fatalf("expected a claim bag, got %v", claims[claimIDTokenClaims])
+	}
+	if _, present := custom["role"]; present {
+		t.Error("an unknown email must not acquire profile attributes")
 	}
 }
 
@@ -233,6 +350,28 @@ func TestPublicKeyPEMIsParseable(t *testing.T) {
 	if _, err := x509.ParsePKIXPublicKey(block.Bytes); err != nil {
 		t.Fatalf("public key does not parse: %v", err)
 	}
+}
+
+// decodeClaims reads a token's payload without verifying it, for tests that are
+// asserting on claim content rather than on signature validity.
+func decodeClaims(t *testing.T, token string) map[string]any {
+	t.Helper()
+	if token == "" {
+		t.Fatal("no token to decode")
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatalf("expected three token segments, got %d", len(parts))
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("unmarshal claims: %v", err)
+	}
+	return claims
 }
 
 func publishedPublicKey(t *testing.T, h *Handler) *rsa.PublicKey {

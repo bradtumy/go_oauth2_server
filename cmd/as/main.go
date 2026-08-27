@@ -80,12 +80,24 @@ func main() {
 
 	// TAT IdP mode: tokenator stands in for a customer's own identity provider,
 	// minting Trusted Auth Tokens for a third-party tenant to consume.
-	tatHandler, err := tatidp.NewHandler(signer, cfg.TATIssuer, cfg.TATTenantHost, cfg.TATTokenTTL)
+	tatHandler, err := tatidp.NewHandler(tatidp.Options{
+		Signer:                    signer,
+		Issuer:                    cfg.TATIssuer,
+		Audience:                  cfg.TATAudience,
+		TenantHost:                cfg.TATTenantHost,
+		TokenTTL:                  cfg.TATTokenTTL,
+		Scopes:                    cfg.TATScopes,
+		AuthorizationDetailsTypes: cfg.TATAuthorizationDetailsTypes,
+		Identities:                identityStore,
+	})
 	if err != nil {
 		log.Fatalf("init tat idp handler: %v", err)
 	}
 	if cfg.TATTenantHost != "" {
-		log.Printf("TAT IdP enabled: issuer=%s tenant_host=%s callback=%s", cfg.TATIssuer, cfg.TATTenantHost, tatHandler.CallbackURL)
+		// The issuer and audience are what a relying party matches on, so log
+		// both: a mismatch here is the usual cause of a rejected token.
+		log.Printf("TAT IdP enabled: issuer=%s audience=%s tenant_host=%s callback=%s",
+			cfg.TATIssuer, tatHandler.Audience, cfg.TATTenantHost, tatHandler.CallbackURL)
 	} else {
 		log.Printf("TAT IdP disabled (set TAT_TENANT_HOST to enable)")
 	}

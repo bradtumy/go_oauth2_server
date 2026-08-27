@@ -54,9 +54,19 @@ type Config struct {
 	// customer IdP, minting tokens for a third-party tenant to consume, so the
 	// issuer and audience here are deliberately not tokenator's own.
 	// TATTenantHost empty disables the feature.
-	TATIssuer     string
-	TATTenantHost string
-	TATTokenTTL   time.Duration
+	//
+	// TATIssuer identifies this server to the relying party and must be a URL it
+	// can reach, so behind a tunnel it is the public tunnel URL.
+	//
+	// TATAudience is the relying party's authorization server. It is a separate
+	// value from TATTenantHost, which is only the host the signed token is
+	// POSTed back to; conflating them causes audience-mismatch rejections.
+	TATIssuer                    string
+	TATAudience                  string
+	TATTenantHost                string
+	TATTokenTTL                  time.Duration
+	TATScopes                    string
+	TATAuthorizationDetailsTypes []string
 }
 
 // UpstreamRedirectURL is the callback the upstream provider must be configured
@@ -202,6 +212,14 @@ func Load() (*Config, error) {
 
 	cfg.TATTenantHost = strings.TrimSpace(getEnv("TAT_TENANT_HOST", ""))
 	cfg.TATIssuer = firstNonEmpty(getEnv("TAT_ISSUER", ""), cfg.Issuer)
+	// Falls back to the tenant host only as a convenience for setups where the
+	// authorization server and the callback host really are the same origin.
+	cfg.TATAudience = strings.TrimSpace(getEnv("TAT_AUDIENCE", ""))
+	if cfg.TATAudience == "" && cfg.TATTenantHost != "" {
+		cfg.TATAudience = "https://" + cfg.TATTenantHost
+	}
+	cfg.TATScopes = strings.TrimSpace(getEnv("TAT_SCOPES", ""))
+	cfg.TATAuthorizationDetailsTypes = splitAndTrim(getEnv("TAT_AUTHORIZATION_DETAILS_TYPES", ""))
 	tatTokenTTL, err := parseDurationSeconds("TAT_TOKEN_TTL_SECONDS", defaultTATTokenTTL)
 	if err != nil {
 		return nil, err
