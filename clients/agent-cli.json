@@ -8,7 +8,7 @@
   ],
   "scopes": [
     "tickets.read",
-    "tickets.write",
-    "refunds.create"
+    "orders.read",
+    "orders.write"
   ]
 }
