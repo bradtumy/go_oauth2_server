@@ -21,3 +21,8 @@ data/
 
 # Signing keys — never commit private keys
 /keys/
+
+# Internal reference material — must not be committed to a public repo.
+# Contains Twilio account identifiers, staging hostnames, and links to
+# internal documents; GitHub push protection blocks it, correctly.
+/docs/Whitney_Bug_Bash_Repo.md
