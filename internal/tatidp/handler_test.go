@@ -413,3 +413,55 @@ func extractHiddenInput(t *testing.T, body, field string) string {
 	}
 	return rest[:end]
 }
+
+// TestNonceSurvivesLoginRedirect covers the full relying-party handshake shape:
+// the nonce arrives as a query parameter on the redirect to the login page, and
+// is only readable again when the form is submitted. If the login form does not
+// carry it forward, the token is minted with an empty nonce and the relying
+// party rejects it with nothing useful to debug from.
+func TestNonceSurvivesLoginRedirect(t *testing.T) {
+	h := newTestHandler(t, testTenantHost)
+
+	// 1. The relying party redirects the user here, nonce in the query string.
+	loginURL := "/tat/login?nonce=rp-nonce-xyz&state=rp-state-1"
+	rec := httptest.NewRecorder()
+	h.ShowLogin(rec, httptest.NewRequest(http.MethodGet, loginURL, nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected the login form, got %d", rec.Code)
+	}
+	page := rec.Body.String()
+	if got := extractHiddenInput(t, page, "nonce"); got != "rp-nonce-xyz" {
+		t.Fatalf("login form must carry the nonce forward, got %q", got)
+	}
+	if got := extractHiddenInput(t, page, "state"); got != "rp-state-1" {
+		t.Fatalf("login form must carry other params forward, got %q", got)
+	}
+
+	// 2. The user submits, and the hidden fields come back with the form.
+	form := url.Values{}
+	form.Set("name", "Alice Anderson")
+	form.Set("email", "alice@example.com")
+	form.Set("nonce", extractHiddenInput(t, page, "nonce"))
+	form.Set("state", extractHiddenInput(t, page, "state"))
+
+	req := httptest.NewRequest(http.MethodPost, "/tat/login", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec = httptest.NewRecorder()
+	h.HandleLogin(rec, req)
+
+	claims := decodeClaims(t, extractHiddenInput(t, rec.Body.String(), "token"))
+	if claims["nonce"] != "rp-nonce-xyz" {
+		t.Fatalf("token nonce = %v, want the value the relying party sent", claims["nonce"])
+	}
+
+	// The callback POST still forwards state, but not the nonce: the signed
+	// token already carries it.
+	callback := rec.Body.String()
+	if !strings.Contains(callback, "rp-state-1") {
+		t.Error("state should be forwarded to the relying party")
+	}
+	if strings.Contains(callback, `name="nonce"`) {
+		t.Error("nonce should not be duplicated as a callback form field")
+	}
+}

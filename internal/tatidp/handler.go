@@ -119,7 +119,7 @@ func (h *Handler) ShowLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	data := map[string]any{
 		"CallbackURL": h.CallbackURL,
-		"Passthrough": passthroughParams(r.URL.Query()),
+		"Passthrough": loginPassthrough(r.URL.Query()),
 	}
 	if err := h.templates.ExecuteTemplate(w, "tat_login.html", data); err != nil {
 		log.Printf("tatidp: template error: %v", err)
@@ -211,7 +211,7 @@ func (h *Handler) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	data := map[string]any{
 		"CallbackURL": h.CallbackURL,
 		"Token":       token,
-		"Passthrough": passthroughParams(r.Form),
+		"Passthrough": callbackPassthrough(r.Form),
 	}
 	if err := h.templates.ExecuteTemplate(w, "tat_callback.html", data); err != nil {
 		log.Printf("tatidp: template error: %v", err)
@@ -231,12 +231,30 @@ func (h *Handler) PublicKeyPEM(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(pemStr))
 }
 
-// passthroughParams collects params other than the known login fields, so
-// any tenant round-trip values (state, nonce already handled separately,
-// request ids, etc.) survive the login -> callback hop without needing to
-// know their exact names ahead of time.
-func passthroughParams(values url.Values) []kv {
-	skip := map[string]bool{"name": true, "email": true, "nonce": true}
+// loginPassthrough carries relying-party values from the login request into the
+// form POST.
+//
+// The nonce must survive this hop. It arrives as a query parameter on the
+// redirect and is only readable from the form on submit, so dropping it here
+// mints a token with an empty nonce that the relying party then rejects.
+func loginPassthrough(values url.Values) []kv {
+	return passthroughParams(values, "name", "email")
+}
+
+// callbackPassthrough forwards values on to the relying party. The nonce is
+// excluded because the signed token already carries it.
+func callbackPassthrough(values url.Values) []kv {
+	return passthroughParams(values, "name", "email", "nonce")
+}
+
+// passthroughParams collects params other than skipKeys, so relying-party
+// round-trip values (state, request ids, and anything else) survive a hop
+// without needing to know their names ahead of time.
+func passthroughParams(values url.Values, skipKeys ...string) []kv {
+	skip := make(map[string]bool, len(skipKeys))
+	for _, k := range skipKeys {
+		skip[k] = true
+	}
 	keys := make([]string, 0, len(values))
 	for k := range values {
 		if skip[k] {
