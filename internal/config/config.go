@@ -13,10 +13,13 @@ import (
 
 // Config represents runtime configuration for the authorization server.
 type Config struct {
-	Issuer                     string
-	MetadataIssuer             string
-	Audience                   string
-	SigningKeyPEM              []byte
+	Issuer         string
+	MetadataIssuer string
+	Audience       string
+	SigningKeyPEM  []byte
+	// SigningKeySource records where the key came from, so a fallback to the
+	// committed default is visible rather than silent.
+	SigningKeySource           string
 	SigningKeyID               string
 	SigningKeyDir              string
 	SigningKeyRotationInterval time.Duration
@@ -146,11 +149,14 @@ func Load() (*Config, error) {
 	}
 
 	if cfg.SigningKeyDir == "" {
-		signingKey, err := loadSigningKeyPEM()
+		signingKey, source, err := loadSigningKeyPEM()
 		if err != nil {
 			return nil, err
 		}
 		cfg.SigningKeyPEM = signingKey
+		cfg.SigningKeySource = source
+	} else {
+		cfg.SigningKeySource = "AS_SIGNING_KEYS_DIR=" + cfg.SigningKeyDir
 	}
 
 	rotationSeconds, err := parseDurationSecondsAllowZero("AS_SIGNING_KEY_ROTATION_SECONDS", 0)
@@ -270,21 +276,26 @@ func Load() (*Config, error) {
 	return cfg, nil
 }
 
-func loadSigningKeyPEM() ([]byte, error) {
+// SigningKeySourceBuiltIn marks a configuration that fell back to the signing
+// key committed in this package. That key is public, so anything relying on it
+// can have its tokens forged by anyone holding the source.
+const SigningKeySourceBuiltIn = "built-in default (PUBLIC, committed in internal/config)"
+
+func loadSigningKeyPEM() ([]byte, string, error) {
 	if key := strings.TrimSpace(getEnv("AS_SIGNING_KEY_PEM", "")); key != "" {
-		return []byte(key), nil
+		return []byte(key), "AS_SIGNING_KEY_PEM", nil
 	}
 	if path := strings.TrimSpace(getEnv("AS_SIGNING_KEY_PATH", "")); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read signing key: %w", err)
+			return nil, "", fmt.Errorf("read signing key: %w", err)
 		}
-		return data, nil
+		return data, "AS_SIGNING_KEY_PATH=" + path, nil
 	}
 	if strings.TrimSpace(defaultSigningKeyPEM) == "" {
-		return nil, errors.New("missing signing key")
+		return nil, "", errors.New("missing signing key")
 	}
-	return []byte(defaultSigningKeyPEM), nil
+	return []byte(defaultSigningKeyPEM), SigningKeySourceBuiltIn, nil
 }
 
 func parseDurationSeconds(env string, fallback int) (time.Duration, error) {

@@ -94,6 +94,17 @@ func main() {
 		log.Fatalf("init tat idp handler: %v", err)
 	}
 	if cfg.TATTenantHost != "" {
+		// A relying party is configured with the public half of whatever key
+		// signs these tokens. Signing them with the key committed in this
+		// repository would let anyone holding the source forge a token asserting
+		// any end user, so refuse rather than quietly hand out forgeable
+		// assertions. This is easy to hit by restarting without the key mounted.
+		if cfg.SigningKeySource == config.SigningKeySourceBuiltIn {
+			log.Fatalf("refusing to enable the TAT IdP while signing with the built-in default key: " +
+				"it is committed in internal/config and therefore public, so anyone could forge tokens " +
+				"your relying party would accept. Generate a key and set AS_SIGNING_KEY_PATH:\n" +
+				"  openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out keys/tat-signing-key.pem")
+		}
 		// The issuer and audience are what a relying party matches on, so log
 		// both: a mismatch here is the usual cause of a rejected token.
 		log.Printf("TAT IdP enabled: issuer=%s audience=%s tenant_host=%s callback=%s",
@@ -1506,7 +1517,7 @@ func loadDotEnv() {
 }
 
 func logConfiguration(cfg *config.Config) {
-	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s client_store=%s clients_db=%s admin_addr=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s signing_key_dir=%s key_rotation_interval=%s authorize_rl=%d/%d token_rl=%d/%d introspect_rl=%d/%d admin_rl=%d/%d", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.ClientStoreDriver, cfg.ClientDBPath, cfg.AdminAddr, cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL, cfg.SigningKeyDir, cfg.SigningKeyRotationInterval, cfg.AuthorizeRateLimitRPS, cfg.AuthorizeRateLimitBurst, cfg.TokenRateLimitRPS, cfg.TokenRateLimitBurst, cfg.IntrospectRateLimitRPS, cfg.IntrospectRateLimitBurst, cfg.AdminRateLimitRPS, cfg.AdminRateLimitBurst)
+	log.Printf("config: issuer=%s audience=%s allow_legacy=%t admin_token_set=%t seed=%s client_store=%s clients_db=%s admin_addr=%s code_ttl=%s access_ttl=%s refresh_ttl=%s obo_ttl=%s signing_key_source=%q signing_key_dir=%s key_rotation_interval=%s authorize_rl=%d/%d token_rl=%d/%d introspect_rl=%d/%d admin_rl=%d/%d", cfg.Issuer, cfg.Audience, cfg.AllowLegacy, cfg.AdminToken != "", cfg.SeedIdentitiesPath, cfg.ClientStoreDriver, cfg.ClientDBPath, cfg.AdminAddr, cfg.CodeTTL, cfg.AccessTokenTTL, cfg.RefreshTokenTTL, cfg.OBOTokenTTL, cfg.SigningKeySource, cfg.SigningKeyDir, cfg.SigningKeyRotationInterval, cfg.AuthorizeRateLimitRPS, cfg.AuthorizeRateLimitBurst, cfg.TokenRateLimitRPS, cfg.TokenRateLimitBurst, cfg.IntrospectRateLimitRPS, cfg.IntrospectRateLimitBurst, cfg.AdminRateLimitRPS, cfg.AdminRateLimitBurst)
 }
 
 func buildClientStore(cfg *config.Config) (store.ClientStore, error) {
