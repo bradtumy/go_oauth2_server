@@ -15,12 +15,17 @@ import (
 )
 
 var (
-	clientID    = getEnv("CLIENT_ID", "human-web")
-	authURL     = getEnv("AUTH_URL", "http://localhost:8080/oauth2/authorize")
-	tokenURL    = getEnv("TOKEN_URL", "http://localhost:8080/oauth2/token")
-	redirectURI = getEnv("REDIRECT_URI", "http://localhost:5555/callback")
-	scope       = getEnv("SCOPE", "tickets.read")
-	rsURL       = getEnv("RS_URL", "http://localhost:9090")
+	clientID = getEnv("CLIENT_ID", "human-web")
+	// CLIENT_SECRET is optional: set it for a confidential client, leave it
+	// empty for a public client relying on PKCE.
+	clientSecret = getEnv("CLIENT_SECRET", "")
+	authURL      = getEnv("AUTH_URL", "http://localhost:8080/oauth2/authorize")
+	tokenURL     = getEnv("TOKEN_URL", "http://localhost:8080/oauth2/token")
+	redirectURI  = getEnv("REDIRECT_URI", "http://localhost:5555/callback")
+	scope        = getEnv("SCOPE", "tickets.read")
+	// RS_URL may be empty when pointing at an authorization server whose
+	// resource servers are elsewhere; the protected-API call is then skipped.
+	rsURL = getEnv("RS_URL", "http://localhost:9090")
 
 	// Store PKCE verifier and state per session (in production, use proper session management)
 	codeVerifier string
@@ -444,6 +449,12 @@ func exchangeCodeForTokens(code string) (*TokenResponse, error) {
 	data.Set("redirect_uri", redirectURI)
 	data.Set("client_id", clientID)
 	data.Set("code_verifier", codeVerifier)
+	// Confidential clients authenticate at the token endpoint. Public clients
+	// leave this unset and rely on PKCE alone, which is the better fit for a
+	// client running on an end user's machine.
+	if clientSecret != "" {
+		data.Set("client_secret", clientSecret)
+	}
 
 	log.Printf("Exchanging code for tokens...")
 	log.Printf("Token URL: %s", tokenURL)
@@ -536,6 +547,12 @@ func decodeJWT(token string) string {
 
 // callResourceServer makes a request to the Resource Server using the access token
 func callResourceServer(accessToken string) (string, int) {
+	// With no resource server configured there is nothing to call, and a failed
+	// request here would read as a broken flow rather than an absent one.
+	if rsURL == "" {
+		return "RS_URL is not set, so no protected API was called. The token above is still valid.", 0
+	}
+
 	// Create request to the RS protected endpoint
 	req, err := http.NewRequest("GET", rsURL+"/accounts/12345/orders/export", nil)
 	if err != nil {

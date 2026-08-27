@@ -73,3 +73,26 @@ services:
     depends_on:
       - as
       - rs
+
+  # A second instance of the same example client, pointed at Twilio's Agent
+  # Identity authorization server instead of tokenator, for driving the flow
+  # before a real agent exists. Opt in with:
+  #   docker compose --profile agent up -d agent-client
+  # Left out of the default `up` so the tokenator demo on 5555 is untouched.
+  agent-client:
+    profiles: ["agent"]
+    image: tokenator-oauth-client:latest
+    container_name: tokenator-agent-client
+    environment:
+      - CLIENT_ID=${AGENT_CLIENT_ID:-}
+      # Leave AGENT_CLIENT_SECRET empty for a public client using PKCE.
+      - CLIENT_SECRET=${AGENT_CLIENT_SECRET:-}
+      - AUTH_URL=${AGENT_AUTH_URL:-}
+      - TOKEN_URL=${AGENT_TOKEN_URL:-}
+      - REDIRECT_URI=${AGENT_REDIRECT_URI:-http://localhost:8090/callback}
+      - SCOPE=${AGENT_SCOPE:-openid profile email}
+      # No tokenator resource server in this flow; the protected-API call is
+      # skipped rather than failing.
+      - RS_URL=${AGENT_RS_URL:-}
+    ports:
+      - "8090:5555"
