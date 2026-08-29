@@ -797,13 +797,6 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		return
 	}
 
-	rarRaw := r.PostFormValue("authorization_details")
-	rar, err := obo.ParseRAR(rarRaw)
-	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_authorization_details", err.Error())
-		return
-	}
-
 	subject, subjectClaims, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
 	if err != nil {
 		code := "invalid_request"
@@ -813,6 +806,14 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		writeOAuthError(w, http.StatusBadRequest, code, err.Error())
 		return
 	}
+
+	rarRaw := r.PostFormValue("authorization_details")
+	rar, err := obo.ParseRAR(rarRaw)
+	if err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_authorization_details", err.Error())
+		return
+	}
+
 	requestedScope := strings.TrimSpace(r.PostFormValue("scope"))
 	if requestedScope != "" && !scopeSubsetList(requestedScope, client.Scopes) {
 		writeOAuthError(w, http.StatusBadRequest, "invalid_scope", "requested scope not allowed")
