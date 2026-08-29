@@ -55,7 +55,7 @@ if [ "${HTTP_STATUS}" = "200" ]; then
   echo "  - Token audience"
   echo "  - Human subject (sub)"
   echo "  - Agent actor (act.actor)"
-  echo "  - Permission hash (perm)"
+  echo "  - Granted authorization_details"
   echo "  - Authorization details"
 elif [ "${HTTP_STATUS}" = "401" ]; then
   echo "✗ Unauthorized (401)"
@@ -73,7 +73,7 @@ elif [ "${HTTP_STATUS}" = "403" ]; then
   echo ""
   echo "Possible issues:"
   echo "  - Insufficient permissions"
-  echo "  - Permission hash mismatch"
+  echo "  - Authorization-detail type, action, or resource mismatch"
   echo "  - Authorization details don't match the resource"
 else
   echo "✗ Request failed with status ${HTTP_STATUS}"

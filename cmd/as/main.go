@@ -800,20 +800,8 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 	rarRaw := r.PostFormValue("authorization_details")
 	rar, err := obo.ParseRAR(rarRaw)
 	if err != nil {
-		writeOAuthError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		writeOAuthError(w, http.StatusBadRequest, "invalid_authorization_details", err.Error())
 		return
-	}
-	if len(rar) == 0 {
-		scope := r.PostFormValue("scope")
-		if scope != "" {
-			actions := strings.Fields(scope)
-			if len(actions) > 0 {
-				rar = []obo.RAR{{
-					Type:    "scope",
-					Actions: actions,
-				}}
-			}
-		}
 	}
 
 	subject, subjectClaims, err := s.oboService.ValidateSubjectToken(r.Context(), subjectToken, subjectTokenType)
@@ -877,7 +865,7 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		if errors.Is(err, obo.ErrNoPermissions) {
 			status = http.StatusForbidden
 		}
-		writeOAuthError(w, status, "invalid_request", err.Error())
+		writeOAuthError(w, status, "invalid_authorization_details", err.Error())
 		return
 	}
 
@@ -904,7 +892,9 @@ func (s *authorizationServer) handleTokenExchange(w http.ResponseWriter, r *http
 		"expires_in":            expiresIn,
 		"human_subject":         subject,
 		"actor":                 actClaim.Actor,
-		"authorization_details": rar,
+		"authorization_details": filteredRAR,
+		// Deprecated compatibility projection. Resource servers should enforce
+		// the granted authorization_details object directly.
 		"perm":                  perms,
 	})
 }

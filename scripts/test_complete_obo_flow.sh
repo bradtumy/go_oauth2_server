@@ -67,9 +67,10 @@ OBO_TOKEN=$(curl -sS -X POST "${AS_BASE}/oauth2/token" \
   -d "client_id=${CLIENT_ID}" \
   -d "client_secret=${CLIENT_SECRET}" \
   --data-urlencode 'authorization_details=[{
-    "type": "agent-action",
+    "type": "https://github.com/bradtumy/tokenator/authorization-details/delegated-action",
+    "locations": ["'${AUDIENCE}'"],
     "actions": ["orders:export"],
-    "constraints": {"resource_ids": ["'${ACCOUNT_ID}'"]}
+    "identifier": "'${ACCOUNT_ID}'"
   }]' | jq -r '.access_token')
 
 if [ -z "${OBO_TOKEN}" ] || [ "${OBO_TOKEN}" = "null" ]; then
