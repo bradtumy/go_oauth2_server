@@ -48,7 +48,7 @@ USER_TOKEN=$(printf '%s' "$TOKEN_JSON" | python -c "import json,sys; print(json.
 
 printf "[3/4] Minting actor assertion and performing token exchange...\n" >&2
 ACTOR_ASSERTION=$(go run ./tools/mint_assertion -actor agent:ingestor-42 -client "${AGENT_CLIENT_ID}")
-RAR='[{"type":"agent-action","locations":["'"${RS_BASE}"'"],"actions":["orders:export"],"constraints":{"resource_ids":["'"${ACCOUNT_ID}"'"],"time_limit_sec":900,"max_records":1000,"purpose":"customer_export"}}]'
+RAR='[{"type":"https://github.com/bradtumy/tokenator/authorization-details/delegated-action","locations":["'"${RS_BASE}"'"],"actions":["orders:export"],"identifier":"'"${ACCOUNT_ID}"'","constraints":{"time_limit_sec":900,"max_records":1000,"purpose":"customer_export"}}]'
 OBO_JSON=$(curl -s -X POST "${AS_BASE}/oauth2/token" \
   -u "${AGENT_CLIENT_ID}:${AGENT_CLIENT_SECRET}" \
   -d "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \

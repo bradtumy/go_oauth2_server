@@ -89,7 +89,7 @@ tokenator implements a minimal OAuth 2.0 authorization server (AS) and resource 
 
 **Key Concepts:**
 - **Scopes**: Coarse-grained permissions (e.g., `tickets.read`, `tickets.write`)
-- **Authorization Details**: Fine-grained permissions defined in [RAR RFC 9396](https://www.rfc-editor.org/rfc/rfc9396.html) (e.g., `orders:export`)
+- **Authorization Details**: Fine-grained permissions defined in [RAR RFC 9396](https://www.rfc-editor.org/rfc/rfc9396.html), using Tokenator's documented [delegated-action type](docs/authorization-details/delegated-action.md)
 - **On-Behalf-Of (OBO)**: Token exchange allowing a service to act on behalf of a user ([RFC 8693](https://datatracker.ietf.org/doc/html/rfc8693))
 
 ```
@@ -268,17 +268,18 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'client_id=agent-cli' \
   -d 'client_secret=agent-cli-secret' \
   --data-urlencode 'authorization_details=[{
-    "type": "agent-action",
+    "type": "https://github.com/bradtumy/tokenator/authorization-details/delegated-action",
+    "locations": ["http://localhost:9090"],
     "actions": ["tickets.export"],
-    "constraints": {"resource_ids": ["acct:abc"]}
+    "identifier": "acct:abc"
   }]' | jq .
 ```
 
 **Response includes:**
-- `access_token`: OBO JWT with `sub` (human), `act.actor` (agent), `perm` hash, and `authorization_details`
+- `access_token`: OBO JWT with `sub` (human), `act.actor` (agent), and the granted `authorization_details`
 - `issued_token_type`: `urn:ietf:params:oauth:token-type:access_token`
 
-The `perm` claim is a SHA-256 hash of the normalized `authorization_details`, enabling efficient permission verification.
+The private `perm` claim is a derived, deprecated compatibility projection. Resource servers must enforce the granted `authorization_details` directly.
 
 ### 5. Resource Server Access
 
@@ -293,8 +294,9 @@ curl -sS -H "Authorization: Bearer <OBO_ACCESS_TOKEN>" \
 - JWT signature and standard claims (exp, iss, aud)
 - Human subject (`sub`)
 - Agent actor (`act.actor` matches registered agent)
-- Permission hash (`perm` matches authorization_details)
-- Resource constraints (e.g., `resource_ids` contains requested account)
+- Registered authorization-detail type and action
+- Resource-server `locations` and protected-resource `identifier`
+- API-specific constraints carried by the granted authorization detail
 
 ### Token Introspection
 
@@ -712,7 +714,7 @@ curl -sS -X POST http://localhost:8080/oauth2/token \
   -d 'audience=http://localhost:9090' \
   -d 'client_id=agent-cli' \
   -d 'client_secret=agent-cli-secret' \
-  --data-urlencode 'authorization_details=[{"type":"agent-action","actions":["tickets.export"],"constraints":{"resource_ids":["acct:abc"]}}]' | jq .
+  --data-urlencode 'authorization_details=[{"type":"https://github.com/bradtumy/tokenator/authorization-details/delegated-action","locations":["http://localhost:9090"],"actions":["tickets.export"],"identifier":"acct:abc"}]' | jq .
 ```
 
 - The server supports token exchange (RFC 8693), so you can use the above request to trade a subject token for an on-behalf-of access token.
@@ -731,7 +733,8 @@ curl -sS -H "Authorization: Bearer <OBO_ACCESS_TOKEN>" \
 
 - Request `/oauth2/authorize` without `human_id`/`email` → `400 invalid_request`.
 - Perform token exchange with an unknown agent or mismatched `client_id` → `400 invalid_request`.
-- Request OBO permissions that the agent is not entitled to → `403 invalid_request` with `no permissions` message.
+- Submit an unknown or malformed authorization-details type → `400 invalid_authorization_details`.
+- Request actions that the agent is not entitled to → `403 invalid_authorization_details` with a `no permissions` message.
 
 ### Seeding identities
 

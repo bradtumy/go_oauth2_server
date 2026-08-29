@@ -242,29 +242,8 @@ func containsResource(claims map[string]any, acctID string) bool {
 }
 
 func matchResource(detail map[string]any, acctID string) bool {
-	constraints, ok := detail["constraints"].(map[string]any)
-	if !ok {
-		return false
-	}
-	ids, ok := constraints["resource_ids"]
-	if !ok {
-		return false
-	}
-	switch val := ids.(type) {
-	case []any:
-		for _, id := range val {
-			if s, ok := id.(string); ok && s == acctID {
-				return true
-			}
-		}
-	case []string:
-		for _, s := range val {
-			if s == acctID {
-				return true
-			}
-		}
-	}
-	return false
+	identifier, ok := detail["identifier"].(string)
+	return ok && identifier == acctID
 }
 
 func nestedString(claims map[string]any, path ...string) string {

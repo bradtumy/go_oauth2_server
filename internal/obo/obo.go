@@ -5,18 +5,30 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/url"
 	"strings"
 	"time"
 
 	internaljwt "tokenator/internal/jwt"
 )
 
-// RAR represents a Rich Authorization Request entry.
+// DelegatedActionType identifies Tokenator's RFC 9396 authorization-details
+// profile for a resource-bound delegated action.
+const DelegatedActionType = "https://github.com/bradtumy/tokenator/authorization-details/delegated-action"
+
+// LegacyAgentActionType remains registered for compatibility with Tokenator's
+// original examples. New clients should use DelegatedActionType.
+const LegacyAgentActionType = "agent-action"
+
+// RAR represents an RFC 9396 authorization_details entry. Locations, actions,
+// and identifier are RFC-defined common fields. The remaining fields are
+// defined by the DelegatedActionType profile.
 type RAR struct {
 	Type        string         `json:"type"`
 	Locations   []string       `json:"locations,omitempty"`
 	Actions     []string       `json:"actions,omitempty"`
-	Datatypes   []string       `json:"datatypes,omitempty"`
+	Identifier  string         `json:"identifier,omitempty"`
 	Constraints map[string]any `json:"constraints,omitempty"`
 }
 
@@ -222,32 +234,68 @@ func (s *Service) IssueOBOToken(ctx context.Context, claims OBOClaims) (string, 
 // ParseRAR decodes authorization_details JSON into the RAR structure.
 func ParseRAR(raw string) ([]RAR, error) {
 	if strings.TrimSpace(raw) == "" {
-		return nil, nil
+		return nil, errors.New("authorization_details is required")
 	}
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.DisallowUnknownFields()
 	var rar []RAR
-	if err := json.Unmarshal([]byte(raw), &rar); err != nil {
+	if err := decoder.Decode(&rar); err != nil {
 		return nil, fmt.Errorf("parse authorization_details: %w", err)
+	}
+	if err := ensureJSONEOF(decoder); err != nil {
+		return nil, fmt.Errorf("parse authorization_details: %w", err)
+	}
+	if len(rar) == 0 {
+		return nil, errors.New("authorization_details must contain at least one entry")
+	}
+	for i := range rar {
+		if err := validateRAR(rar[i]); err != nil {
+			return nil, fmt.Errorf("authorization_details[%d]: %w", i, err)
+		}
 	}
 	return rar, nil
 }
 
-func extractResourceIDs(entry RAR) []string {
-	if entry.Constraints == nil {
+func ensureJSONEOF(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
+
+func validateRAR(entry RAR) error {
+	if entry.Type == LegacyAgentActionType {
+		if len(entry.Actions) == 0 {
+			return errors.New("actions is required")
+		}
 		return nil
 	}
-	if val, ok := entry.Constraints["resource_ids"]; ok {
-		switch v := val.(type) {
-		case []any:
-			ids := make([]string, 0, len(v))
-			for _, item := range v {
-				if s, ok := item.(string); ok {
-					ids = append(ids, s)
-				}
-			}
-			return ids
-		case []string:
-			return v
+	if entry.Type != DelegatedActionType {
+		return fmt.Errorf("unknown type %q", entry.Type)
+	}
+	if len(entry.Locations) == 0 {
+		return errors.New("locations is required")
+	}
+	for _, location := range entry.Locations {
+		parsed, err := url.ParseRequestURI(location)
+		if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+			return fmt.Errorf("invalid location %q", location)
 		}
+	}
+	if len(entry.Actions) == 0 {
+		return errors.New("actions is required")
+	}
+	for _, action := range entry.Actions {
+		if strings.TrimSpace(action) == "" {
+			return errors.New("actions cannot contain an empty value")
+		}
+	}
+	if strings.TrimSpace(entry.Identifier) == "" {
+		return errors.New("identifier is required")
 	}
 	return nil
 }
@@ -303,8 +351,8 @@ func collectPerms(rar []RAR) []string {
 		if len(actions) == 0 {
 			continue
 		}
-		resourceIDs := extractResourceIDs(entry)
-		if len(resourceIDs) == 0 {
+		resourceID := strings.TrimSpace(entry.Identifier)
+		if resourceID == "" {
 			for _, action := range actions {
 				perms = append(perms, normalizeAction(action))
 			}
@@ -312,9 +360,7 @@ func collectPerms(rar []RAR) []string {
 		}
 		for _, action := range actions {
 			actNorm := normalizeAction(action)
-			for _, resource := range resourceIDs {
-				perms = append(perms, fmt.Sprintf("%s:%s", actNorm, resource))
-			}
+			perms = append(perms, fmt.Sprintf("%s:%s", actNorm, resourceID))
 		}
 	}
 	return perms

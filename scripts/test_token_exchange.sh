@@ -114,9 +114,10 @@ OBO_RESPONSE=$(curl -sS -X POST "${AS_BASE}/oauth2/token" \
   -d "client_id=${CLIENT_ID}" \
   -d "client_secret=${CLIENT_SECRET}" \
   --data-urlencode 'authorization_details=[{
-    "type": "agent-action",
+    "type": "https://github.com/bradtumy/tokenator/authorization-details/delegated-action",
+    "locations": ["'${AUDIENCE}'"],
     "actions": ["orders:export"],
-    "constraints": {"resource_ids": ["acct:abc"]}
+    "identifier": "acct:abc"
   }]')
 
 echo "${OBO_RESPONSE}" | jq .
