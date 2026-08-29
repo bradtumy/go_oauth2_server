@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,8 +26,15 @@ func TestTokenExchangeRejectsInvalidAuthorizationDetails(t *testing.T) {
 	_, server := newTestServer(t, idStore)
 	defer server.Close()
 
-	assertionForm := url.Values{"email": {human.Email}}
-	assertionResp, err := http.PostForm(server.URL+"/subject-assertion", assertionForm)
+	assertionBody, err := json.Marshal(map[string]string{"email": human.Email})
+	if err != nil {
+		t.Fatalf("encode subject assertion request: %v", err)
+	}
+	assertionResp, err := http.Post(
+		server.URL+"/subject-assertion",
+		"application/json",
+		bytes.NewReader(assertionBody),
+	)
 	if err != nil {
 		t.Fatalf("subject assertion request: %v", err)
 	}
